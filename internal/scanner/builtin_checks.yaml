@@ -1,0 +1,336 @@
+checks:
+  - id: ssh-private-key
+    name: SSH private key
+    product: SSH
+    vendor: OpenSSH
+    category: remote_access
+    type: private_key
+    paths:
+      - ~/.ssh/id_rsa
+      - ~/.ssh/id_ed25519
+      - ~/.ssh/id_ecdsa
+      - ~/.ssh/id_dsa
+    glob_paths:
+      - ~/.ssh/*
+    exclude_names:
+      - "*.pub"
+      - known_hosts
+      - known_hosts.old
+      - authorized_keys
+      - config
+      - environment
+      - rc
+      - allowed_signers
+      - revoked_keys
+    patterns:
+      - '-----BEGIN (?:OPENSSH|RSA|EC|DSA|ENCRYPTED)? ?PRIVATE KEY-----'
+
+  - id: generic-private-key
+    name: Private key block
+    product: Cryptographic material
+    vendor: Unknown
+    category: cryptographic_material
+    type: private_key
+    paths:
+      - server.key
+      - private.key
+      - ssl.key
+      - ssl/ssl.key
+      - certs/server.key
+      - config/ssl/ssl.key
+      - /config/ssl/ssl.key
+    patterns:
+      - '-----BEGIN (?:RSA |EC |ENCRYPTED )?PRIVATE KEY-----'
+
+  - id: git-credential-url
+    name: Git credential URL
+    product: Git
+    vendor: Git
+    category: source_control
+    type: token
+    template_cross_check: true
+    paths:
+      - ~/.git-credentials
+      - .git/config
+    patterns:
+      - 'https?://[^:\s/@]+:[^@\s]+@[^/\s]+'
+
+  - id: netrc-credential
+    name: netrc credential
+    product: netrc
+    vendor: Unix
+    category: credential_store
+    type: password
+    paths:
+      - ~/.netrc
+      - .netrc
+    patterns:
+      - '(?is)\bmachine\s+\S+.*?\blogin\s+\S+.*?\bpassword\s+\S+'
+
+  - id: kubernetes-credential
+    name: Kubernetes credential
+    product: Kubernetes
+    vendor: Kubernetes
+    category: container_orchestration
+    type: token
+    paths:
+      - ~/.kube/config
+      - kubeconfig
+      - /var/run/secrets/kubernetes.io/serviceaccount/token
+    patterns:
+      - '(?m)^\s*(?:token|client-key-data):\s*[A-Za-z0-9._+/=-]{20,}'
+      - 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+
+  - id: postgres-pgpass
+    name: PostgreSQL password file
+    product: PostgreSQL
+    vendor: PostgreSQL
+    category: database
+    type: password
+    paths:
+      - ~/.pgpass
+      - '%APPDATA%\postgresql\pgpass.conf'
+      - .pgpass
+      - pgpass.conf
+    patterns:
+      - '(?m)^[^#:\r\n]*:[^:\r\n]*:[^:\r\n]*:[^:\r\n]*:[^\r\n]+$'
+
+  - id: mysql-option-password
+    name: MySQL option file password
+    product: MySQL
+    vendor: Oracle
+    category: database
+    type: password
+    paths:
+      - ~/.my.cnf
+      - .my.cnf
+      - .mylogin.cnf
+      - my.cnf
+    patterns:
+      - '(?mi)^\s*password\s*=\s*[^\r\n]+$'
+
+  - id: docker-auth-config
+    name: Docker auth config
+    product: Docker Registry
+    vendor: Docker
+    category: container_registry
+    type: token
+    paths:
+      - ~/.docker/config.json
+      - '%USERPROFILE%\.docker\config.json'
+      - .docker/config.json
+    patterns:
+      - '"auth"\s*:\s*"[A-Za-z0-9+/=]{20,}"'
+      - '"identitytoken"\s*:\s*"[^"\r\n]{20,}"'
+
+  - id: jwt-token
+    name: JWT token
+    product: JWT-bearing service
+    vendor: Unknown
+    category: application
+    type: token
+    template_location_cross_check: true
+    paths:
+      - .env
+      - .env.development
+      - .env.local
+      - .env.production
+      - .env.test
+      - .envrc
+      - auth.json
+      - auth.yaml
+      - auth.yml
+      - config.ini
+      - config.json
+      - config.toml
+      - config.yaml
+      - config.yml
+      - config/config.ini
+      - config/config.json
+      - config/config.toml
+      - config/config.yaml
+      - config/config.yml
+      - config/credentials
+      - config/secrets
+      - credentials
+      - credentials.ini
+      - credentials.json
+      - credentials.toml
+      - credentials.yaml
+      - credentials.yml
+      - secrets
+      - secrets.ini
+      - secrets.json
+      - secrets.toml
+      - secrets.yaml
+      - secrets.yml
+      - settings.ini
+      - settings.json
+      - settings.toml
+      - settings.yaml
+      - settings.yml
+      - values.yaml
+      - values.yml
+      - ~/.bash_history
+      - ~/.zsh_history
+      - ~/.sh_history
+      - ~/.mysql_history
+      - ~/.psql_history
+      - .bash_history
+      - .zsh_history
+      - .sh_history
+      - .mysql_history
+      - .psql_history
+      - ConsoleHost_history.txt
+      - '%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
+      - '%APPDATA%\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt'
+      - '%USERPROFILE%\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
+      - '%USERPROFILE%\AppData\Roaming\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt'
+      - ~/.config/config.ini
+      - ~/.config/config.json
+      - ~/.config/config.toml
+      - ~/.config/config.yaml
+      - ~/.config/config.yml
+      - ~/.config/credentials
+      - ~/.config/secrets
+      - '%APPDATA%\config.ini'
+      - '%APPDATA%\config.json'
+      - '%APPDATA%\config.toml'
+      - '%APPDATA%\config.yaml'
+      - '%APPDATA%\config.yml'
+      - '%APPDATA%\credentials'
+      - '%APPDATA%\secrets'
+    patterns:
+      - 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
+
+  - id: service-account-private-key
+    name: Service account private key
+    product: Cloud service account
+    vendor: Unknown
+    category: cloud
+    type: private_key
+    paths:
+      - serviceAccountKey.json
+      - firebase-service-account.json
+      - google-credentials.json
+    patterns:
+      - '"private_key"\s*:\s*"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----\\n[^"]+-----END (?:RSA |EC )?PRIVATE KEY-----\\n"'
+
+  - id: shell-history-credential
+    name: Shell history credential
+    product: Command line service
+    vendor: Unknown
+    category: cli
+    type: secret_value
+    template_cross_check: true
+    paths:
+      - ~/.bash_history
+      - ~/.zsh_history
+      - ~/.sh_history
+      - ~/.mysql_history
+      - ~/.psql_history
+      - .bash_history
+      - .zsh_history
+      - .sh_history
+      - .mysql_history
+      - .psql_history
+      - ConsoleHost_history.txt
+      - '%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
+      - '%APPDATA%\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt'
+      - '%USERPROFILE%\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'
+      - '%USERPROFILE%\AppData\Roaming\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt'
+    patterns:
+      - '(?i)(?:password|passwd|pwd|token|api[_-]?key|secret|passphrase)\s*(?:=|\s+)\s*[''"]?[^''"\s]{4,}'
+      - '(?i)--(?:password|passwd|token|api-key|secret)(?:=|\s+)[''"]?[^''"\s]{4,}'
+      - '(?i)-(?:password|passwd|pwd|token|access_?token|api_?-?key|client_?secret|secret|passphrase)\s+[''"]?[^''"\s]{4,}'
+      - '(?i)\$env:[A-Z_][A-Z0-9_]*\s*=\s*[''"][^''"\r\n]{4,}[''"]'
+      - '(?i)ConvertTo-SecureString\s+[''"][^''"\r\n]{4,}[''"]\s+-AsPlainText'
+      - '(?i)Authorization\s*[:=]\s*[''"]?Bearer\s+[A-Za-z0-9._~+/=-]{10,}'
+
+  - id: htpasswd-entry
+    name: htpasswd entry
+    product: HTTP Basic Authentication
+    vendor: Apache
+    category: web_server
+    type: password
+    paths:
+      - .htpasswd
+      - htpasswd
+      - /etc/apache2/.htpasswd
+      - /etc/httpd/.htpasswd
+      - /etc/nginx/.htpasswd
+    patterns:
+      - '(?m)^[^#:\s][^:\r\n]*:(?:\$2[aby]\$|\$apr1\$|\{SHA\}|[A-Za-z0-9./]{13,})'
+
+  - id: rsync-secret
+    name: rsync secret
+    product: rsync
+    vendor: Samba
+    category: file_transfer
+    type: password
+    paths:
+      - rsyncd.secrets
+      - /etc/rsyncd.secrets
+      - /etc/rsyncd/rsyncd.secrets
+      - rsyncd.conf
+      - /etc/rsyncd.conf
+    patterns:
+      - '(?m)^[^#:\s][^:\r\n]*:[^\r\n]{4,}$'
+      - '(?mi)^\s*secrets\s+file\s*=\s*\S+'
+
+  - id: windows-unattended-password
+    name: Windows unattended setup password
+    product: Windows
+    vendor: Microsoft
+    category: operating_system
+    type: password
+    paths:
+      - unattend.txt
+      - unattend.xml
+      - unattended.xml
+      - sysprep.inf
+      - sysprep.xml
+      - '%WINDIR%\Panther\Unattend.xml'
+      - '%WINDIR%\Panther\Unattended.xml'
+      - '%WINDIR%\System32\Sysprep\sysprep.xml'
+      - '%WINDIR%\System32\Sysprep\sysprep.inf'
+    patterns:
+      - '(?is)<(?:AdministratorPassword|Password)>\s*<Value>[^<]{4,}</Value>'
+      - '(?mi)^\s*(?:AdminPassword|Password)\s*=\s*[^;\r\n]{4,}'
+
+  - id: windows-gpp-cpassword
+    name: Windows Group Policy Preferences cpassword
+    product: Windows Group Policy Preferences
+    vendor: Microsoft
+    category: active_directory
+    type: password
+    paths:
+      - Groups.xml
+      - Services.xml
+      - ScheduledTasks.xml
+      - Printers.xml
+      - Drives.xml
+      - DataSources.xml
+      - groups.xml
+      - services.xml
+      - scheduledtasks.xml
+      - printers.xml
+      - drives.xml
+      - datasources.xml
+    patterns:
+      - 'cpassword\s*=\s*"[^"]{8,}"'
+
+  - id: rdcman-credential
+    name: RDCMan credential
+    product: Remote Desktop Connection Manager
+    vendor: Microsoft
+    category: remote_access
+    type: password
+    paths:
+      - RDCMan.settings
+      - RDCMan.rdg
+      - connections.rdg
+      - '%LOCALAPPDATA%\Microsoft\Remote Desktop Connection Manager\RDCMan.settings'
+    patterns:
+      - '(?is)<password>[^<]{4,}</password>'
+      - '(?is)<logonCredentials[^>]*>.*?</logonCredentials>'

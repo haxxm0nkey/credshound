@@ -1,0 +1,879 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/haxxm0nkey/credshound/internal/report"
+	"github.com/haxxm0nkey/credshound/internal/scanner"
+	"github.com/haxxm0nkey/credshound/internal/templates"
+	"github.com/haxxm0nkey/credshound/internal/updater"
+)
+
+var version = "dev"
+var defaultInstallDir = updater.DefaultInstallDir
+var updateTemplates = updater.Update
+var currentTime = time.Now
+
+const staleTemplatesAfter = 7 * 24 * time.Hour
+
+type missingTemplatesError struct {
+	CacheDir string
+}
+
+type rawCLIError struct {
+	Message string
+	Help    string
+}
+
+func (e rawCLIError) Error() string {
+	if e.Help == "" {
+		return e.Message
+	}
+	return e.Message + "\n" + e.Help
+}
+
+func (e missingTemplatesError) Error() string {
+	return "no templates found"
+}
+
+func main() {
+	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		printRunError(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func printRunError(w io.Writer, err error) {
+	var raw rawCLIError
+	if errors.As(err, &raw) {
+		fmt.Fprintf(w, "%v\n", err)
+		return
+	}
+	fmt.Fprintf(w, "credshound: %v\n", err)
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func flagErrorMessage(err error) string {
+	message := err.Error()
+	const prefix = "flag provided but not defined: "
+	if strings.HasPrefix(message, prefix) {
+		return "unknown flag: " + strings.TrimSpace(strings.TrimPrefix(message, prefix))
+	}
+	return message
+}
+
+func run(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return runScan(args, stdout, stderr)
+	}
+
+	switch args[0] {
+	case "inspect-templates":
+		return runInspectTemplates(args[1:], stdout)
+	case "update-templates", "-ut", "-update-templates":
+		return runUpdateTemplates(args[1:], stdout)
+	case "-version", "--version":
+		fmt.Fprintf(stdout, "credshound %s\n", version)
+		return nil
+	case "-h", "--help":
+		printScanUsage(stdout)
+		return nil
+	default:
+		if hasHelpFlag(args) {
+			printScanUsage(stdout)
+			return nil
+		}
+		return runScan(args, stdout, stderr)
+	}
+}
+
+func runScan(args []string, stdout, stderr io.Writer) error {
+	var roots []string
+	var skipDirs repeatedFlag
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	templateShort := fs.String("t", "", "path to LOLCreds templates repository, entries directory, or zip archive")
+	templateLong := fs.String("templates", "", "path to LOLCreds templates repository, entries directory, or zip archive")
+	jsonlShort := fs.Bool("j", false, "write findings in JSONL format")
+	jsonlLong := fs.Bool("jsonl", false, "write findings in JSONL format")
+	bloodHoundShort := fs.Bool("bh", false, "write findings as BloodHound OpenGraph JSON")
+	bloodHoundLong := fs.Bool("bloodhound", false, "write findings as BloodHound OpenGraph JSON")
+	outputShort := fs.String("o", "", "output file to write findings")
+	outputLong := fs.String("output", "", "output file to write findings")
+	sources := fs.String("sources", "", "comma-separated sources to scan: env,file")
+	excludeSourcesFlag := fs.String("exclude-sources", "", "comma-separated sources to exclude: env,file")
+	debug := fs.Bool("debug", false, "print template compatibility stats to stderr")
+	versionFlag := fs.Bool("version", false, "show version")
+	showSecrets := fs.Bool("show-secrets", false, "print full secret values")
+	silent := fs.Bool("silent", false, "suppress non-finding output")
+	noColorLong := fs.Bool("no-color", false, "disable output content coloring")
+	noColorShort := fs.Bool("nc", false, "disable output content coloring")
+	disableUpdateCheckShort := fs.Bool("duc", false, "disable template freshness warning")
+	disableUpdateCheckLong := fs.Bool("disable-update-check", false, "disable template freshness warning")
+	maxFileSize := fs.Int64("max-file-size", 2*1024*1024, "maximum config file size to read in bytes")
+	recursive := fs.Bool("recursive", false, "recursively search roots for bare config filenames")
+	maxDepth := fs.Int("max-depth", 6, "maximum recursive directory depth below each root")
+	timeout := fs.Duration("timeout", 60*time.Second, "scan timeout")
+	fs.Var(&skipDirs, "skip-dir", "directory name to skip during recursive scans; may be repeated")
+
+	if hasHelpFlag(args) {
+		printScanUsage(stdout)
+		return nil
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printScanUsage(stdout)
+			return nil
+		}
+		return rawCLIError{Message: flagErrorMessage(err), Help: "Use -h for help."}
+	}
+	if *versionFlag {
+		fmt.Fprintf(stdout, "credshound %s\n", version)
+		return nil
+	}
+	noColor := *noColorLong || *noColorShort
+	disableUpdateCheck := *disableUpdateCheckShort || *disableUpdateCheckLong
+	resolvedDataFlag, err := resolveTemplateFlag(*templateShort, *templateLong)
+	if err != nil {
+		return err
+	}
+	formatName := "text"
+	if *jsonlShort || *jsonlLong {
+		formatName = "jsonl"
+	}
+	if *bloodHoundShort || *bloodHoundLong {
+		if formatName != "text" {
+			return errors.New("use only one output format: text, jsonl, or bloodhound")
+		}
+		formatName = "bloodhound"
+	}
+	outputPath, err := resolveOutputFlag(*outputShort, *outputLong)
+	if err != nil {
+		return err
+	}
+	includeSources, err := parseSources(*sources)
+	if err != nil {
+		return err
+	}
+	if len(includeSources) == 0 {
+		includeSources = map[string]bool{"env": true, "file": true}
+	}
+	excludeSources, err := parseSources(*excludeSourcesFlag)
+	if err != nil {
+		return err
+	}
+	if noColor {
+		// Text output is intentionally plain for now; keep the flag for nuclei-like CLI muscle memory.
+	}
+	if *silent {
+		// No banner is emitted today, so findings remain unchanged.
+	}
+
+	resolvedDataDir, usingCache, err := resolveDataDir(resolvedDataFlag)
+	if err != nil {
+		var missing missingTemplatesError
+		if errors.As(err, &missing) && *silent && resolvedDataFlag == "" {
+			return nil
+		}
+		if errors.As(err, &missing) && formatName == "text" && !*silent && resolvedDataFlag == "" {
+			printMissingTemplates(stdout, missing.CacheDir, !noColor)
+			return nil
+		}
+		return err
+	}
+
+	entries, err := templates.Load(resolvedDataDir)
+	if err != nil {
+		return err
+	}
+	var metadata *updater.Result
+	if usingCache && !disableUpdateCheck {
+		if result, err := updater.ReadMetadata(resolvedDataDir); err == nil {
+			metadata = &result
+		}
+	}
+	for _, root := range fs.Args() {
+		if root != "" {
+			roots = append(roots, root)
+		}
+	}
+	if len(roots) == 0 {
+		roots = append(roots, ".")
+	}
+	skipDirMap := defaultSkipDirs()
+	for _, dir := range skipDirs {
+		skipDirMap[dir] = true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	result, err := scanner.ScanWithStats(ctx, entries, scanner.Options{
+		Roots:          roots,
+		MaxFileSize:    *maxFileSize,
+		Recursive:      *recursive,
+		MaxDepth:       *maxDepth,
+		SkipDirs:       skipDirMap,
+		ShowSecrets:    *showSecrets,
+		URLBase:        "https://lolcreds.haxx.it",
+		EnableBuiltins: true,
+		IncludeSources: includeSources,
+		ExcludeSources: excludeSources,
+	})
+	if err != nil {
+		return err
+	}
+	outputFindings := result.Findings
+	if *silent {
+		outputFindings = withoutInfoFindings(outputFindings)
+	}
+	if formatName == "text" && !*silent {
+		printBanner(stdout, !noColor)
+		printScanInfo(stdout, result, roots, includeSources, excludeSources, *recursive, *maxDepth, resolvedDataDir, usingCache, metadata, noColor)
+	}
+	if *debug && !*silent {
+		fmt.Fprintf(
+			stderr,
+			"loaded %d templates, scanned %d credentials, compiled %d patterns, skipped %d unsupported patterns\n",
+			result.Stats.Templates,
+			result.Stats.Credentials,
+			result.Stats.Patterns,
+			result.Stats.SkippedPatterns,
+		)
+	}
+
+	findingsWriter := stdout
+	var outputFile *os.File
+	if outputPath != "" {
+		outputFile, err = os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return err
+		}
+		defer outputFile.Close()
+		findingsWriter = outputFile
+	}
+
+	switch formatName {
+	case "text":
+		return report.WriteText(findingsWriter, outputFindings, report.TextOptions{Color: !noColor})
+	case "jsonl":
+		enc := json.NewEncoder(findingsWriter)
+		for _, finding := range outputFindings {
+			if err := enc.Encode(finding); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "bloodhound":
+		return report.WriteBloodHound(findingsWriter, outputFindings)
+	}
+	return nil
+}
+
+func runUpdateTemplates(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("update-templates", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	installDir, err := defaultInstallDir()
+	if err != nil {
+		return err
+	}
+	timeout := fs.Duration("timeout", 2*time.Minute, "download timeout")
+	noColorLong := fs.Bool("no-color", false, "disable output content coloring")
+	noColorShort := fs.Bool("nc", false, "disable output content coloring")
+	silent := fs.Bool("silent", false, "suppress non-essential output")
+
+	if hasHelpFlag(args) {
+		printUpdateUsage(stdout, installDir)
+		return nil
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printUpdateUsage(stdout, installDir)
+			return nil
+		}
+		return rawCLIError{Message: flagErrorMessage(err), Help: "Use -ut -h for help."}
+	}
+	noColor := *noColorLong || *noColorShort
+
+	if !*silent {
+		printBanner(stdout, !noColor)
+		printStatus(stdout, "INF", "Downloading LOLCreds templates", !noColor)
+		printStatus(stdout, "INF", "Source: "+updater.DefaultSourceURL, !noColor)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	result, err := updateTemplates(ctx, updater.Options{
+		SourceURL:  updater.DefaultSourceURL,
+		InstallDir: installDir,
+	})
+	if err != nil {
+		if !*silent {
+			printUpdateFailure(stdout, err, updater.DefaultSourceURL, !noColor)
+		}
+		return nil
+	}
+
+	if !*silent {
+		printStatus(stdout, "INF", fmt.Sprintf("Extracted %d file(s)", result.Files), !noColor)
+		printStatus(stdout, "INF", "Templates installed to "+result.InstallDir, !noColor)
+	}
+	return nil
+}
+
+func runInspectTemplates(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("inspect-templates", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	templateShort := fs.String("t", "", "path to LOLCreds templates repository, entries directory, or zip archive")
+	templateLong := fs.String("templates", "", "path to LOLCreds templates repository, entries directory, or zip archive")
+
+	if hasHelpFlag(args) {
+		printInspectTemplatesUsage(stdout)
+		return nil
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printInspectTemplatesUsage(stdout)
+			return nil
+		}
+		return rawCLIError{Message: flagErrorMessage(err), Help: "Use inspect-templates -h for help."}
+	}
+
+	resolvedDataFlag, err := resolveTemplateFlag(*templateShort, *templateLong)
+	if err != nil {
+		return err
+	}
+	resolvedDataDir, _, err := resolveDataDir(resolvedDataFlag)
+	if err != nil {
+		return err
+	}
+	entries, err := templates.Load(resolvedDataDir)
+	if err != nil {
+		return err
+	}
+
+	report := inspectTemplateData(entries)
+	writeTemplateInspection(stdout, report)
+	return nil
+}
+
+type templateInspection struct {
+	EnvironmentVariables []string
+	AbsolutePaths        []string
+	RelativePaths        []string
+	Patterns             []string
+}
+
+func inspectTemplateData(entries []templates.Entry) templateInspection {
+	envNames := make(map[string]bool)
+	absolutePaths := make(map[string]bool)
+	relativePaths := make(map[string]bool)
+	patterns := make(map[string]bool)
+
+	for _, entry := range entries {
+		for _, credential := range entry.Credentials {
+			for _, location := range credential.Location {
+				locationType := strings.ToLower(strings.TrimSpace(location.Type))
+				for _, value := range splitTemplatePathList(location.Path) {
+					switch locationType {
+					case "environment":
+						envNames[value] = true
+					case "config_file":
+						if isDirectTemplatePath(value) {
+							absolutePaths[value] = true
+						} else {
+							relativePaths[value] = true
+						}
+					}
+				}
+			}
+			for _, looksLike := range credential.LooksLike {
+				pattern := strings.TrimSpace(looksLike.Pattern)
+				if pattern != "" {
+					patterns[pattern] = true
+				}
+			}
+		}
+	}
+
+	return templateInspection{
+		EnvironmentVariables: sortedKeys(envNames),
+		AbsolutePaths:        sortedKeys(absolutePaths),
+		RelativePaths:        sortedKeys(relativePaths),
+		Patterns:             sortedKeys(patterns),
+	}
+}
+
+func splitTemplatePathList(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		part = strings.Trim(part, `"'`)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func isDirectTemplatePath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if filepath.IsAbs(path) || path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+		return true
+	}
+	if strings.HasPrefix(path, "%") && strings.Contains(path[1:], "%") {
+		return true
+	}
+	if len(path) >= 3 && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+		return true
+	}
+	return false
+}
+
+func sortedKeys(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func writeTemplateInspection(w io.Writer, report templateInspection) {
+	writeStringSection(w, "Environment variables", report.EnvironmentVariables)
+	writeStringSection(w, "Absolute paths", report.AbsolutePaths)
+	writeStringSection(w, "Relative paths", report.RelativePaths)
+	writeStringSection(w, "Patterns", report.Patterns)
+}
+
+func writeStringSection(w io.Writer, title string, values []string) {
+	fmt.Fprintf(w, "%s (%d)\n", title, len(values))
+	for _, value := range values {
+		fmt.Fprintln(w, value)
+	}
+	fmt.Fprintln(w)
+}
+
+func resolveDataDir(dataDir string) (string, bool, error) {
+	if dataDir != "" {
+		return dataDir, false, nil
+	}
+	cacheDir, err := defaultInstallDir()
+	if err != nil {
+		return "", false, err
+	}
+	if updater.HasTemplates(cacheDir) {
+		return cacheDir, true, nil
+	}
+	return "", false, missingTemplatesError{CacheDir: cacheDir}
+}
+
+func resolveTemplateFlag(values ...string) (string, error) {
+	var resolved string
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if resolved != "" && resolved != value {
+			return "", errors.New("use either -t or -templates, not both")
+		}
+		resolved = value
+	}
+	return resolved, nil
+}
+
+func resolveOutputFlag(short, long string) (string, error) {
+	if short != "" && long != "" && short != long {
+		return "", errors.New("use either -o or -output, not both")
+	}
+	if short != "" {
+		return short, nil
+	}
+	return long, nil
+}
+
+func printUsage(w io.Writer) {
+	printScanUsage(w)
+}
+
+func printScanUsage(w io.Writer) {
+	printBanner(w, false)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  credshound [flags] [root...]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  credshound -ut")
+	fmt.Fprintln(w, "  credshound .")
+	fmt.Fprintln(w, "  credshound ~/project /etc")
+	fmt.Fprintln(w, "  credshound -t ~/Downloads/lolcreds-data-main.zip")
+	fmt.Fprintln(w, "  credshound -recursive .")
+	fmt.Fprintln(w, "  credshound -t ~/lolcreds-templates -sources env,file")
+	fmt.Fprintln(w, "  credshound -t ~/lolcreds-templates -exclude-sources env -j")
+	fmt.Fprintln(w, "  credshound -bloodhound -o credshound-bloodhound.json")
+	fmt.Fprintln(w, "  credshound -silent -j -o findings.jsonl")
+	fmt.Fprintln(w, "  credshound inspect-templates -t ~/lolcreds-templates")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "TARGET:")
+	fmt.Fprintln(w, "  [root...]                  roots for project-local config files; default .")
+	fmt.Fprintln(w, "  -recursive                 recursively search roots for bare filenames like .env or values.yaml")
+	fmt.Fprintln(w, "  -max-depth N               maximum recursive depth below each root, default 6")
+	fmt.Fprintln(w, "  -skip-dir NAME             directory name to skip during recursive scans; repeatable")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "TEMPLATES:")
+	fmt.Fprintln(w, "  -t, -templates PATH        LOLCreds templates directory, entries directory, or zip archive")
+	fmt.Fprintln(w, "  -ut, -update-templates     download/update LOLCreds templates")
+	fmt.Fprintln(w, "  -duc, -disable-update-check disable template freshness warning")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "SOURCES:")
+	fmt.Fprintln(w, "  -sources LIST              sources to scan: env,file")
+	fmt.Fprintln(w, "  -exclude-sources LIST      sources to exclude: env,file")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "OUTPUT:")
+	fmt.Fprintln(w, "  -silent                    display findings only")
+	fmt.Fprintln(w, "  -nc, -no-color             disable output content coloring (ANSI escape codes)")
+	fmt.Fprintln(w, "  -j, -jsonl                 write findings in JSONL format")
+	fmt.Fprintln(w, "  -bh, -bloodhound           write findings as BloodHound OpenGraph JSON")
+	fmt.Fprintln(w, "  -o, -output PATH           write findings to file")
+	fmt.Fprintln(w, "  -show-secrets              print full secret values")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "OPTIMIZATIONS:")
+	fmt.Fprintln(w, "  -max-file-size N           maximum config file size in bytes, default 2097152")
+	fmt.Fprintln(w, "  -timeout DURATION          scan timeout, default 1m")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "DEBUG:")
+	fmt.Fprintln(w, "  -debug                     print template compatibility stats")
+	fmt.Fprintln(w, "  -version                   show version")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Recursive scanning is only used for bare config filenames. Absolute paths, home-relative paths,")
+	fmt.Fprintln(w, "and relative paths with directories are checked directly. Skip dirs affect only recursive searches.")
+}
+
+func printInspectTemplatesUsage(w io.Writer) {
+	printBanner(w, false)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  credshound inspect-templates [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  credshound inspect-templates -t ~/lolcreds-templates")
+	fmt.Fprintln(w, "  credshound inspect-templates -t ~/Downloads/lolcreds-data-main.zip")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  -t, -templates PATH        LOLCreds templates directory, entries directory, or zip archive")
+}
+
+func printUpdateUsage(w io.Writer, defaultInstallDir string) {
+	printBanner(w, false)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  credshound update-templates [flags]")
+	fmt.Fprintln(w, "  credshound -ut [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  credshound update-templates")
+	fmt.Fprintln(w, "  credshound -ut")
+	fmt.Fprintln(w, "  credshound -t ~/Downloads/lolcreds-data-main.zip -recursive .")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Template cache:")
+	fmt.Fprintf(w, "  %s\n", defaultInstallDir)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  -timeout DURATION     Download timeout, default 2m")
+	fmt.Fprintln(w, "  -silent               Suppress non-essential output")
+	fmt.Fprintln(w, "  -nc, -no-color        Disable output content coloring (ANSI escape codes)")
+}
+
+func printMissingTemplates(w io.Writer, cacheDir string, color bool) {
+	printBanner(w, color)
+	printStatus(w, "WRN", "No LOLCreds templates found in cache", color)
+	printStatus(w, "INF", "Template cache: "+cacheDir, color)
+	printStatus(w, "INF", onlineUpdateHint(), color)
+	printStatus(w, "INF", offlineScanHint(), color)
+	fmt.Fprintln(w)
+}
+
+func updateError(err error) error {
+	var downloadErr updater.DownloadError
+	if errors.As(err, &downloadErr) {
+		return fmt.Errorf("%w\n%s\n%s", err, onlineUpdateHint(), offlineScanHint())
+	}
+	return err
+}
+
+func printUpdateFailure(w io.Writer, err error, sourceURL string, color bool) {
+	printStatus(w, "WRN", "Could not download LOLCreds templates", color)
+	printStatus(w, "INF", "Reason: "+err.Error(), color)
+	printStatus(w, "INF", offlineScanHint(), color)
+	printStatus(w, "INF", "Offline zip: "+sourceURL, color)
+}
+
+func onlineUpdateHint() string {
+	return fmt.Sprintf("Run credshound -ut to download templates from %s", updater.DefaultSourceURL)
+}
+
+func offlineScanHint() string {
+	return "Offline scan: credshound -t /path/to/lolcreds-data-main.zip"
+}
+
+func printBanner(w io.Writer, color bool) {
+	lines := []string{
+		"   ______              __     __  __                      __",
+		"  / ____/_______  ____/ /____/ / / /___  __  ______  ____/ /",
+		" / /   / ___/ _ \\/ __  / ___/ /_/ / __ \\/ / / / __ \\/ __  / ",
+		"/ /___/ /  /  __/ /_/ (__  ) __  / /_/ / /_/ / / / / /_/ /  ",
+		"\\____/_/   \\___/\\__,_/____/_/ /_/\\____/\\__,_/_/ /_/\\__,_/   ",
+	}
+	for _, line := range lines {
+		if color {
+			line = ansi(line, magentaBold)
+		}
+		fmt.Fprintln(w, line)
+	}
+	tagline := fmt.Sprintf("        credential surface scanner | v%s", version)
+	if color {
+		tagline = ansi(tagline, white)
+	}
+	fmt.Fprintln(w, tagline)
+	fmt.Fprintln(w)
+}
+
+func printScanInfo(w io.Writer, result scanner.Result, roots []string, include, exclude map[string]bool, recursive bool, maxDepth int, dataDir string, usingCache bool, metadata *updater.Result, noColor bool) {
+	color := !noColor
+	if usingCache {
+		printStatus(w, "INF", "Templates: "+dataDir+" (cache)", color)
+		printTemplateAge(w, metadata, currentTime(), color)
+	} else {
+		printStatus(w, "INF", "Templates: "+dataDir, color)
+	}
+	printStatus(w, "INF", fmt.Sprintf("Loaded %d template(s) and %d credential definition(s)", result.Stats.Templates, result.Stats.Credentials), color)
+	printStatus(w, "INF", fmt.Sprintf("Compiled %d matcher pattern(s)", result.Stats.Patterns), color)
+	if result.Stats.SkippedPatterns > 0 {
+		printStatus(w, "WRN", fmt.Sprintf("Skipped %d unsupported matcher pattern(s)", result.Stats.SkippedPatterns), color)
+	}
+	printStatus(w, "INF", "Enabled sources: "+enabledSources(include, exclude), color)
+	printStatus(w, "INF", "Scan roots: "+strings.Join(roots, ", "), color)
+	if recursive {
+		printStatus(w, "INF", fmt.Sprintf("Recursive bare-filename scan enabled with max depth %d", maxDepth), color)
+	}
+	printStatus(w, "INF", fmt.Sprintf("Found %d credential exposure(s)", credentialFindingCount(result.Findings)), color)
+	if observations := infoFindingCount(result.Findings); observations > 0 {
+		printStatus(w, "INF", fmt.Sprintf("Found %d informational observation(s)", observations), color)
+	}
+	fmt.Fprintln(w)
+}
+
+func withoutInfoFindings(findings []scanner.Finding) []scanner.Finding {
+	out := make([]scanner.Finding, 0, len(findings))
+	for _, finding := range findings {
+		if strings.EqualFold(finding.Confidence, "info") {
+			continue
+		}
+		out = append(out, finding)
+	}
+	return out
+}
+
+func credentialFindingCount(findings []scanner.Finding) int {
+	return len(withoutInfoFindings(findings))
+}
+
+func infoFindingCount(findings []scanner.Finding) int {
+	count := 0
+	for _, finding := range findings {
+		if strings.EqualFold(finding.Confidence, "info") {
+			count++
+		}
+	}
+	return count
+}
+
+func printTemplateAge(w io.Writer, metadata *updater.Result, now time.Time, color bool) {
+	if metadata == nil || metadata.UpdatedAt.IsZero() {
+		return
+	}
+	age := now.Sub(metadata.UpdatedAt)
+	if age < 0 {
+		age = 0
+	}
+	if age >= staleTemplatesAfter {
+		printStatus(w, "WRN", fmt.Sprintf("Templates are %s old. Run credshound -ut to update.", ageLabel(age)), color)
+		printStatus(w, "INF", offlineScanHint(), color)
+		return
+	}
+	if ageLabel(age) == "today" {
+		printStatus(w, "INF", "Templates last updated today", color)
+		return
+	}
+	printStatus(w, "INF", "Templates last updated "+ageLabel(age)+" ago", color)
+}
+
+func ageLabel(age time.Duration) string {
+	days := int(age.Hours() / 24)
+	if days <= 0 {
+		return "today"
+	}
+	if days == 1 {
+		return "1d"
+	}
+	return fmt.Sprintf("%dd", days)
+}
+
+func printStatus(w io.Writer, level, message string, color bool) {
+	label := "[" + level + "]"
+	if color {
+		switch level {
+		case "INF":
+			label = ansi(label, blueBold)
+		case "WRN":
+			label = ansi(label, yellowBold)
+		default:
+			label = ansi(label, cyanBright)
+		}
+		message = highlightStatusMessage(message)
+	}
+	fmt.Fprintf(w, "%s %s\n", label, message)
+}
+
+func highlightStatusMessage(message string) string {
+	replacements := []struct {
+		old string
+		new string
+	}{
+		{updater.DefaultSourceURL, ansi(updater.DefaultSourceURL, linkBlue)},
+		{"credshound -ut", ansi("credshound -ut", whiteBold)},
+		{"credshound -t /path/to/lolcreds-data-main.zip", ansi("credshound -t /path/to/lolcreds-data-main.zip", whiteBold)},
+	}
+	for _, replacement := range replacements {
+		message = strings.ReplaceAll(message, replacement.old, replacement.new)
+	}
+
+	if strings.HasPrefix(message, "Template cache: ") {
+		return message
+	}
+	if strings.HasPrefix(message, "Templates: ") {
+		return message
+	}
+	return message
+}
+
+func enabledSources(include, exclude map[string]bool) string {
+	all := []string{"env", "file"}
+	var enabled []string
+	for _, source := range all {
+		if len(include) > 0 && !include[source] {
+			continue
+		}
+		if exclude[source] {
+			continue
+		}
+		enabled = append(enabled, source)
+	}
+	if len(enabled) == 0 {
+		return "none"
+	}
+	return strings.Join(enabled, ",")
+}
+
+func ansi(value, color string) string {
+	if value == "" || color == "" {
+		return value
+	}
+	return color + value + reset
+}
+
+func parseSources(value string) (map[string]bool, error) {
+	sources := make(map[string]bool)
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(strings.ToLower(part))
+		if part == "" {
+			continue
+		}
+		source, ok := normalizeSource(part)
+		if !ok {
+			return nil, fmt.Errorf("unsupported source %q", part)
+		}
+		sources[source] = true
+	}
+	return sources, nil
+}
+
+func normalizeSource(source string) (string, bool) {
+	switch source {
+	case "env", "environment":
+		return "env", true
+	case "file", "files", "config_file", "config-files", "config":
+		return "file", true
+	default:
+		return "", false
+	}
+}
+
+func defaultSkipDirs() map[string]bool {
+	return map[string]bool{
+		".cache":       true,
+		".git":         true,
+		".gocache":     true,
+		".hg":          true,
+		".idea":        true,
+		".svn":         true,
+		".terraform":   true,
+		".venv":        true,
+		".vscode":      true,
+		"__pycache__":  true,
+		"build":        true,
+		"coverage":     true,
+		"dist":         true,
+		"node_modules": true,
+		"target":       true,
+		"vendor":       true,
+		"venv":         true,
+	}
+}
+
+type repeatedFlag []string
+
+func (f *repeatedFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *repeatedFlag) Set(value string) error {
+	if value == "" {
+		return errors.New("empty value")
+	}
+	*f = append(*f, value)
+	return nil
+}
+
+const (
+	reset       = "\x1b[0m"
+	magentaBold = "\x1b[1;95m"
+	blueBold    = "\x1b[1;94m"
+	yellowBold  = "\x1b[1;93m"
+	cyanBright  = "\x1b[96m"
+	white       = "\x1b[37m"
+	whiteBold   = "\x1b[1;97m"
+	linkBlue    = "\x1b[4;94m"
+)
