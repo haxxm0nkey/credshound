@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -91,6 +92,226 @@ func TestScanEnvironmentFindingMediumWhenPatternDoesNotMatch(t *testing.T) {
 	}
 	if findings[0].Evidence != "not-****oken" {
 		t.Fatalf("unexpected evidence %q", findings[0].Evidence)
+	}
+}
+
+func TestScanProcEnvironmentFinding(t *testing.T) {
+	procRoot := t.TempDir()
+	processDir := filepath.Join(procRoot, "1234")
+	if err := os.MkdirAll(processDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "comm"), []byte("worker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "environ"), []byte("EXAMPLE_API_TOKEN=ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890\x00PATH=/usr/bin\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := Scan(context.Background(), []templates.Entry{
+		{
+			ID:   "example-product",
+			Name: "Example Product",
+			Credentials: []templates.Credential{
+				{
+					ID:   "api-token-env",
+					Name: "API token from environment variables",
+					Type: "api_token",
+					Location: []templates.Location{
+						{Type: "environment", Path: "EXAMPLE_API_TOKEN"},
+					},
+					LooksLike: []templates.LooksLike{
+						{Pattern: `ex_[A-Za-z0-9]{32,}`},
+					},
+				},
+			},
+		},
+	}, Options{
+		ProcRoot:       procRoot,
+		MaxFileSize:    1024,
+		URLBase:        "https://lolcreds.haxx.it",
+		IncludeSources: map[string]bool{"proc": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 proc finding, got %d: %+v", len(findings), findings)
+	}
+
+	finding := findings[0]
+	if finding.Source != "proc" {
+		t.Fatalf("expected proc source, got %q", finding.Source)
+	}
+	if finding.Origin != OriginTemplate {
+		t.Fatalf("expected template origin, got %q", finding.Origin)
+	}
+	if finding.Confidence != "high" {
+		t.Fatalf("expected high confidence, got %q", finding.Confidence)
+	}
+	if finding.Location != "pid=1234 comm=worker env=EXAMPLE_API_TOKEN" {
+		t.Fatalf("unexpected location %q", finding.Location)
+	}
+	if finding.Evidence != "ex_A****7890" {
+		t.Fatalf("unexpected evidence %q", finding.Evidence)
+	}
+}
+
+func TestScanProcEnvironmentFindingMediumWhenPatternDoesNotMatch(t *testing.T) {
+	procRoot := t.TempDir()
+	processDir := filepath.Join(procRoot, "42")
+	if err := os.MkdirAll(processDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "environ"), []byte("EXAMPLE_API_TOKEN=not-a-template-token\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := Scan(context.Background(), []templates.Entry{
+		{
+			ID:   "example-product",
+			Name: "Example Product",
+			Credentials: []templates.Credential{
+				{
+					ID:   "api-token-env",
+					Name: "API token from environment variables",
+					Type: "api_token",
+					Location: []templates.Location{
+						{Type: "environment", Path: "EXAMPLE_API_TOKEN"},
+					},
+					LooksLike: []templates.LooksLike{
+						{Pattern: `ex_[A-Za-z0-9]{32,}`},
+					},
+				},
+			},
+		},
+	}, Options{
+		ProcRoot:       procRoot,
+		MaxFileSize:    1024,
+		URLBase:        "https://lolcreds.haxx.it",
+		IncludeSources: map[string]bool{"proc": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 proc finding, got %d: %+v", len(findings), findings)
+	}
+	if findings[0].Confidence != "medium" {
+		t.Fatalf("expected medium confidence, got %q", findings[0].Confidence)
+	}
+	if findings[0].Location != "pid=42 env=EXAMPLE_API_TOKEN" {
+		t.Fatalf("unexpected location %q", findings[0].Location)
+	}
+}
+
+func TestAggregateProcEnvironmentMediumFindings(t *testing.T) {
+	procRoot := t.TempDir()
+	processDir := filepath.Join(procRoot, "1460")
+	if err := os.MkdirAll(processDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "comm"), []byte("python\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "environ"), []byte("DB_PASSWORD=changeme-password\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	findings, err := Scan(context.Background(), []templates.Entry{
+		{
+			ID:   "microsoft-sql-server",
+			Name: "Microsoft SQL Server",
+			Credentials: []templates.Credential{
+				{
+					ID:   "sql-login-password",
+					Name: "SQL login password",
+					Type: "username_password",
+					Location: []templates.Location{
+						{Type: "environment", Path: "DB_PASSWORD"},
+					},
+					LooksLike: []templates.LooksLike{
+						{Pattern: `mssql_[A-Za-z0-9]{20,}`},
+					},
+				},
+			},
+		},
+		{
+			ID:   "wikijs",
+			Name: "Wiki.js",
+			Credentials: []templates.Credential{
+				{
+					ID:   "database-storage-auth-secrets",
+					Name: "Database storage auth secrets",
+					Type: "secret_value",
+					Location: []templates.Location{
+						{Type: "environment", Path: "DB_PASSWORD"},
+					},
+					LooksLike: []templates.LooksLike{
+						{Pattern: `changeme-password`},
+					},
+				},
+			},
+		},
+	}, Options{
+		ProcRoot:       procRoot,
+		MaxFileSize:    1024,
+		URLBase:        "https://lolcreds.haxx.it",
+		IncludeSources: map[string]bool{"proc": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	neutral := findingByID(findings, "process", "environment-variable")
+	if neutral == nil {
+		t.Fatalf("expected neutral proc environment finding, got %+v", findings)
+	}
+	if neutral.Source != "proc" || neutral.Confidence != "medium" {
+		t.Fatalf("unexpected neutral proc finding %+v", neutral)
+	}
+	if neutral.Location != "pid=1460 comm=python env=DB_PASSWORD" {
+		t.Fatalf("unexpected neutral location %q", neutral.Location)
+	}
+	if neutral.CredentialType != "password" {
+		t.Fatalf("expected neutral credential type password, got %q", neutral.CredentialType)
+	}
+	if !sameStrings(neutral.References, []string{"microsoft-sql-server", "wikijs"}) {
+		t.Fatalf("unexpected neutral references %+v", neutral.References)
+	}
+
+	if countFinding(findings, "microsoft-sql-server", "sql-login-password") != 0 {
+		t.Fatalf("expected medium product-specific proc finding to be aggregated away, got %+v", findings)
+	}
+	high := findingByID(findings, "wikijs", "database-storage-auth-secrets")
+	if high == nil {
+		t.Fatalf("expected high product-specific proc finding to remain, got %+v", findings)
+	}
+	if high.Confidence != "high" {
+		t.Fatalf("expected high confidence finding, got %+v", high)
+	}
+}
+
+func TestParseProcEnvironment(t *testing.T) {
+	got := parseProcEnvironment([]byte("A=1\x00EMPTY=\x00NO_EQUALS\x00B=two=parts\x00"))
+	if got["A"] != "1" {
+		t.Fatalf("expected A=1, got %+v", got)
+	}
+	if got["EMPTY"] != "" {
+		t.Fatalf("expected EMPTY to be preserved, got %+v", got)
+	}
+	if got["B"] != "two=parts" {
+		t.Fatalf("expected B value with equals, got %+v", got)
+	}
+	if _, ok := got["NO_EQUALS"]; ok {
+		t.Fatalf("expected entry without equals to be skipped, got %+v", got)
+	}
+}
+
+func TestSkippableProcErrorIncludesNoSuchProcess(t *testing.T) {
+	err := fmt.Errorf("open /proc/2/environ: no such process")
+	if !isSkippableProcError(err) {
+		t.Fatalf("expected no such process to be skippable")
 	}
 }
 

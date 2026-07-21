@@ -22,7 +22,7 @@ func TestRunRootFlagHelp(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := stdout.String()
-	for _, want := range []string{"credshound [flags] [root...]", "credshound .", "credshound ~/project /etc", "TARGET:", "TEMPLATES:", "SOURCES:", "OUTPUT:", "-t, -templates", "-sources", "-j, -jsonl", "-bh, -bloodhound", "-o, -output", "-duc, -disable-update-check", "Skip dirs affect only recursive searches"} {
+	for _, want := range []string{"credshound [flags] [root...]", "credshound .", "credshound ~/project /etc", "TARGET:", "TEMPLATES:", "SOURCES:", "FILTERING:", "OUTPUT:", "-t, -templates", "-sources", "env,file,proc", "-id LIST", "-eid LIST", "-severity LIST", "-origin LIST", "-j, -jsonl", "-bh, -bloodhound", "-o, -output", "-duc, -disable-update-check", "Skip dirs affect only recursive searches"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected help output to contain %q, got:\n%s", want, out)
 		}
@@ -252,6 +252,16 @@ func TestRunRegistrySourceFails(t *testing.T) {
 	}
 }
 
+func TestParseProcSource(t *testing.T) {
+	sources, err := parseSources("process,proc-environ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) != 1 || !sources["proc"] {
+		t.Fatalf("expected proc source normalization, got %+v", sources)
+	}
+}
+
 func TestRunTopLevelTemplateFlagScans(t *testing.T) {
 	isolateHome(t)
 	var stdout bytes.Buffer
@@ -285,6 +295,72 @@ func TestRunScansExportedEnvironmentVariable(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunFiltersBySeverity(t *testing.T) {
+	t.Setenv("EXAMPLE_API_TOKEN", "ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run([]string{"-t", "../../testdata/lolcreds-data", "-sources", "env", "-severity", "medium", "-silent", "-nc"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected high finding to be filtered by medium severity, got:\n%s", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunFiltersByID(t *testing.T) {
+	t.Setenv("EXAMPLE_API_TOKEN", "ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run([]string{"-t", "../../testdata/lolcreds-data", "-sources", "env", "-id", "example-product:api-token-env", "-silent", "-nc"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "[example-product:api-token-env]") {
+		t.Fatalf("expected included finding, got:\n%s", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunExcludesByID(t *testing.T) {
+	t.Setenv("EXAMPLE_API_TOKEN", "ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run([]string{"-t", "../../testdata/lolcreds-data", "-sources", "env", "-eid", "example-product", "-silent", "-nc"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected excluded finding to be omitted, got:\n%s", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunRejectsUnsupportedSeverityFilter(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := run([]string{"-t", "../../testdata/lolcreds-data", "-severity", "critical"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected unsupported severity to fail")
+	}
+	if !strings.Contains(err.Error(), `unsupported severity "critical"`) {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("expected no direct output, stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 

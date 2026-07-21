@@ -25,21 +25,25 @@ func scanEnvironment(ctx context.Context, compiled []compiledCredential, opts Op
 					continue
 				}
 
-				confidence := "high"
-				evidence := value
-				if len(item.patterns) > 0 {
-					confidence = "medium"
-					for _, re := range item.patterns {
-						if match := re.FindString(value); match != "" {
-							confidence = "high"
-							evidence = match
-							break
-						}
-					}
-				}
-				findings = append(findings, item.finding("env", confidence, name, evidence, opts))
+				findings = append(findings, environmentValueFinding(item, "env", name, value, opts))
 			}
 		}
 	}
 	return findings
+}
+
+func environmentValueFinding(item compiledCredential, source, location, value string, opts Options) Finding {
+	confidence := "high"
+	evidence := value
+	if len(item.patterns) > 0 {
+		confidence = "medium"
+		for _, re := range item.patterns {
+			if match := re.FindString(value); match != "" {
+				confidence = "high"
+				evidence = match
+				break
+			}
+		}
+	}
+	return item.finding(source, confidence, location, evidence, opts)
 }

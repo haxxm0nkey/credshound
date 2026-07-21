@@ -97,6 +97,8 @@ func sourceColor(source string) string {
 		return yellowBold
 	case "registry":
 		return blueBold
+	case "proc":
+		return cyanBright
 	default:
 		return cyanBright
 	}

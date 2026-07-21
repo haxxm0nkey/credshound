@@ -119,8 +119,16 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	bloodHoundLong := fs.Bool("bloodhound", false, "write findings as BloodHound OpenGraph JSON")
 	outputShort := fs.String("o", "", "output file to write findings")
 	outputLong := fs.String("output", "", "output file to write findings")
-	sources := fs.String("sources", "", "comma-separated sources to scan: env,file")
-	excludeSourcesFlag := fs.String("exclude-sources", "", "comma-separated sources to exclude: env,file")
+	sources := fs.String("sources", "", "comma-separated sources to scan: env,file,proc")
+	excludeSourcesFlag := fs.String("exclude-sources", "", "comma-separated sources to exclude: env,file,proc")
+	includeIDs := fs.String("id", "", "finding IDs to include: template or template:credential")
+	excludeIDs := fs.String("eid", "", "finding IDs to exclude: template or template:credential")
+	includeSeverity := fs.String("severity", "", "finding severities to include: info,medium,high")
+	excludeSeverity := fs.String("es", "", "finding severities to exclude: info,medium,high")
+	includeTypes := fs.String("type", "", "credential types to include")
+	excludeTypes := fs.String("etype", "", "credential types to exclude")
+	includeOrigins := fs.String("origin", "", "finding origins to include: template,builtin,observation")
+	excludeOrigins := fs.String("eorigin", "", "finding origins to exclude: template,builtin,observation")
 	debug := fs.Bool("debug", false, "print template compatibility stats to stderr")
 	versionFlag := fs.Bool("version", false, "show version")
 	showSecrets := fs.Bool("show-secrets", false, "print full secret values")
@@ -178,6 +186,19 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		includeSources = map[string]bool{"env": true, "file": true}
 	}
 	excludeSources, err := parseSources(*excludeSourcesFlag)
+	if err != nil {
+		return err
+	}
+	filters, err := parseFindingFilters(findingFilterInputs{
+		IncludeIDs:      *includeIDs,
+		ExcludeIDs:      *excludeIDs,
+		IncludeSeverity: *includeSeverity,
+		ExcludeSeverity: *excludeSeverity,
+		IncludeTypes:    *includeTypes,
+		ExcludeTypes:    *excludeTypes,
+		IncludeOrigins:  *includeOrigins,
+		ExcludeOrigins:  *excludeOrigins,
+	})
 	if err != nil {
 		return err
 	}
@@ -242,6 +263,7 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	result.Findings = filterFindings(result.Findings, filters)
 	outputFindings := result.Findings
 	if *silent {
 		outputFindings = withoutInfoFindings(outputFindings)
@@ -479,6 +501,175 @@ func writeStringSection(w io.Writer, title string, values []string) {
 	fmt.Fprintln(w)
 }
 
+type findingFilterInputs struct {
+	IncludeIDs      string
+	ExcludeIDs      string
+	IncludeSeverity string
+	ExcludeSeverity string
+	IncludeTypes    string
+	ExcludeTypes    string
+	IncludeOrigins  string
+	ExcludeOrigins  string
+}
+
+type findingFilters struct {
+	IncludeIDs      map[string]bool
+	ExcludeIDs      map[string]bool
+	IncludeSeverity map[string]bool
+	ExcludeSeverity map[string]bool
+	IncludeTypes    map[string]bool
+	ExcludeTypes    map[string]bool
+	IncludeOrigins  map[string]bool
+	ExcludeOrigins  map[string]bool
+}
+
+func parseFindingFilters(inputs findingFilterInputs) (findingFilters, error) {
+	includeSeverity, err := parseValidatedList(inputs.IncludeSeverity, "severity", validSeverity)
+	if err != nil {
+		return findingFilters{}, err
+	}
+	excludeSeverity, err := parseValidatedList(inputs.ExcludeSeverity, "severity", validSeverity)
+	if err != nil {
+		return findingFilters{}, err
+	}
+	includeOrigins, err := parseValidatedList(inputs.IncludeOrigins, "origin", validOrigin)
+	if err != nil {
+		return findingFilters{}, err
+	}
+	excludeOrigins, err := parseValidatedList(inputs.ExcludeOrigins, "origin", validOrigin)
+	if err != nil {
+		return findingFilters{}, err
+	}
+
+	return findingFilters{
+		IncludeIDs:      parseNormalizedList(inputs.IncludeIDs),
+		ExcludeIDs:      parseNormalizedList(inputs.ExcludeIDs),
+		IncludeSeverity: includeSeverity,
+		ExcludeSeverity: excludeSeverity,
+		IncludeTypes:    parseNormalizedList(inputs.IncludeTypes),
+		ExcludeTypes:    parseNormalizedList(inputs.ExcludeTypes),
+		IncludeOrigins:  includeOrigins,
+		ExcludeOrigins:  excludeOrigins,
+	}, nil
+}
+
+func parseValidatedList(value, label string, valid func(string) bool) (map[string]bool, error) {
+	items := parseNormalizedList(value)
+	for item := range items {
+		if !valid(item) {
+			return nil, fmt.Errorf("unsupported %s %q", label, item)
+		}
+	}
+	return items, nil
+}
+
+func parseNormalizedList(value string) map[string]bool {
+	items := make(map[string]bool)
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(strings.ToLower(part))
+		if part == "" {
+			continue
+		}
+		items[part] = true
+	}
+	return items
+}
+
+func validSeverity(value string) bool {
+	switch value {
+	case "info", "low", "medium", "high":
+		return true
+	default:
+		return false
+	}
+}
+
+func validOrigin(value string) bool {
+	switch value {
+	case scanner.OriginTemplate, scanner.OriginBuiltin, scanner.OriginObservation:
+		return true
+	default:
+		return false
+	}
+}
+
+func filterFindings(findings []scanner.Finding, filters findingFilters) []scanner.Finding {
+	if filters.empty() {
+		return findings
+	}
+	out := make([]scanner.Finding, 0, len(findings))
+	for _, finding := range findings {
+		if !findingPassesFilters(finding, filters) {
+			continue
+		}
+		out = append(out, finding)
+	}
+	return out
+}
+
+func (f findingFilters) empty() bool {
+	return len(f.IncludeIDs) == 0 &&
+		len(f.ExcludeIDs) == 0 &&
+		len(f.IncludeSeverity) == 0 &&
+		len(f.ExcludeSeverity) == 0 &&
+		len(f.IncludeTypes) == 0 &&
+		len(f.ExcludeTypes) == 0 &&
+		len(f.IncludeOrigins) == 0 &&
+		len(f.ExcludeOrigins) == 0
+}
+
+func findingPassesFilters(finding scanner.Finding, filters findingFilters) bool {
+	if len(filters.IncludeIDs) > 0 && !findingIDMatches(finding, filters.IncludeIDs) {
+		return false
+	}
+	if findingIDMatches(finding, filters.ExcludeIDs) {
+		return false
+	}
+	if !valueIncluded(finding.Confidence, filters.IncludeSeverity) {
+		return false
+	}
+	if valueExcluded(finding.Confidence, filters.ExcludeSeverity) {
+		return false
+	}
+	if !valueIncluded(finding.CredentialType, filters.IncludeTypes) {
+		return false
+	}
+	if valueExcluded(finding.CredentialType, filters.ExcludeTypes) {
+		return false
+	}
+	if !valueIncluded(finding.Origin, filters.IncludeOrigins) {
+		return false
+	}
+	if valueExcluded(finding.Origin, filters.ExcludeOrigins) {
+		return false
+	}
+	return true
+}
+
+func findingIDMatches(finding scanner.Finding, ids map[string]bool) bool {
+	if len(ids) == 0 {
+		return false
+	}
+	templateID := strings.ToLower(strings.TrimSpace(finding.TemplateID))
+	credentialID := strings.ToLower(strings.TrimSpace(finding.CredentialID))
+	fullID := templateID + ":" + credentialID
+	return ids[templateID] || ids[fullID]
+}
+
+func valueIncluded(value string, include map[string]bool) bool {
+	if len(include) == 0 {
+		return true
+	}
+	return include[strings.ToLower(strings.TrimSpace(value))]
+}
+
+func valueExcluded(value string, exclude map[string]bool) bool {
+	if len(exclude) == 0 {
+		return false
+	}
+	return exclude[strings.ToLower(strings.TrimSpace(value))]
+}
+
 func resolveDataDir(dataDir string) (string, bool, error) {
 	if dataDir != "" {
 		return dataDir, false, nil
@@ -533,6 +724,7 @@ func printScanUsage(w io.Writer) {
 	fmt.Fprintln(w, "  credshound -t ~/Downloads/lolcreds-data-main.zip")
 	fmt.Fprintln(w, "  credshound -recursive .")
 	fmt.Fprintln(w, "  credshound -t ~/lolcreds-templates -sources env,file")
+	fmt.Fprintln(w, "  credshound -t ~/lolcreds-templates -sources env,file,proc")
 	fmt.Fprintln(w, "  credshound -t ~/lolcreds-templates -exclude-sources env -j")
 	fmt.Fprintln(w, "  credshound -bloodhound -o credshound-bloodhound.json")
 	fmt.Fprintln(w, "  credshound -silent -j -o findings.jsonl")
@@ -550,8 +742,18 @@ func printScanUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -duc, -disable-update-check disable template freshness warning")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "SOURCES:")
-	fmt.Fprintln(w, "  -sources LIST              sources to scan: env,file")
-	fmt.Fprintln(w, "  -exclude-sources LIST      sources to exclude: env,file")
+	fmt.Fprintln(w, "  -sources LIST              sources to scan: env,file,proc")
+	fmt.Fprintln(w, "  -exclude-sources LIST      sources to exclude: env,file,proc")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "FILTERING:")
+	fmt.Fprintln(w, "  -id LIST                   include finding IDs: template or template:credential")
+	fmt.Fprintln(w, "  -eid LIST                  exclude finding IDs: template or template:credential")
+	fmt.Fprintln(w, "  -severity LIST             include severities: info,medium,high")
+	fmt.Fprintln(w, "  -es LIST                   exclude severities: info,medium,high")
+	fmt.Fprintln(w, "  -type LIST                 include credential types")
+	fmt.Fprintln(w, "  -etype LIST                exclude credential types")
+	fmt.Fprintln(w, "  -origin LIST               include origins: template,builtin,observation")
+	fmt.Fprintln(w, "  -eorigin LIST              exclude origins: template,builtin,observation")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "OUTPUT:")
 	fmt.Fprintln(w, "  -silent                    display findings only")
@@ -780,7 +982,7 @@ func highlightStatusMessage(message string) string {
 }
 
 func enabledSources(include, exclude map[string]bool) string {
-	all := []string{"env", "file"}
+	all := []string{"env", "file", "proc"}
 	var enabled []string
 	for _, source := range all {
 		if len(include) > 0 && !include[source] {
@@ -826,6 +1028,8 @@ func normalizeSource(source string) (string, bool) {
 		return "env", true
 	case "file", "files", "config_file", "config-files", "config":
 		return "file", true
+	case "proc", "process", "processes", "proc-environ":
+		return "proc", true
 	default:
 		return "", false
 	}

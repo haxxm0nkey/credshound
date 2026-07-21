@@ -19,6 +19,7 @@ It uses [LOLCreds](https://lolcreds.haxx.it/) template data for product-aware ch
 ## ⚡ What It Checks
 
 * **Environment variables** (scanning running process environment for exposed keys).
+* **Linux process environments** via `/proc/*/environ` when explicitly enabled.
 * **Configuration files** and project-local configs.
 * **Common credential artifacts** such as Git credentials, Docker auth config, kubeconfig, shell history (`.bash_history`, `.zsh_history`, PowerShell history), `.netrc`, `.pgpass`, private keys, and similar files.
 
@@ -100,6 +101,20 @@ Scan only environment variables:
 
 ```bash
 credshound -sources env
+```
+
+Scan current and process environment variables on Linux:
+
+```bash
+credshound -sources env,proc
+```
+
+Filter findings by ID, severity, type, or origin:
+
+```bash
+credshound -severity high -type api_key,token .
+credshound -id github,openai:api-key .
+credshound -eid process:environment-variable -origin template,builtin .
 ```
 
 Write JSONL:

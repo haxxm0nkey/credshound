@@ -20,6 +20,7 @@ type Options struct {
 	Recursive      bool
 	MaxDepth       int
 	SkipDirs       map[string]bool
+	ProcRoot       string
 	ShowSecrets    bool
 	URLBase        string
 	EnableBuiltins bool
@@ -80,6 +81,14 @@ func ScanWithStats(ctx context.Context, entries []templates.Entry, opts Options)
 		findings = append(findings, fileFindings...)
 	}
 
+	if sourceEnabled("proc", opts) {
+		procFindings, err := scanProcEnviron(ctx, compiled, opts)
+		if err != nil {
+			return Result{}, err
+		}
+		findings = append(findings, procFindings...)
+	}
+
 	if sourceEnabled("registry", opts) {
 		registryFindings, err := scanRegistry(ctx, compiled, opts)
 		if err != nil {
@@ -89,6 +98,7 @@ func ScanWithStats(ctx context.Context, entries []templates.Entry, opts Options)
 	}
 
 	findings = dedupeFindings(findings)
+	findings = aggregateProcEnvironmentFindings(findings)
 	findings = dedupeHighFindingsBySecret(findings)
 	findings = aggregateInfoFindings(findings)
 	findings = sortFindings(findings)
@@ -261,6 +271,158 @@ type observationSlot struct {
 	refURLs   map[string]string
 	refOrder  []string
 	slotIndex int
+}
+
+type procEnvironmentSlot struct {
+	finding  Finding
+	refSeen  map[string]bool
+	refURLs  map[string]string
+	refOrder []string
+}
+
+func aggregateProcEnvironmentFindings(findings []Finding) []Finding {
+	groups := make(map[string]*procEnvironmentSlot)
+	for _, finding := range findings {
+		key, ok := procEnvironmentReferenceKey(finding)
+		if !ok {
+			continue
+		}
+		group, exists := groups[key]
+		if !exists {
+			group = &procEnvironmentSlot{
+				finding: neutralProcEnvironmentFinding(finding),
+				refSeen: make(map[string]bool),
+				refURLs: make(map[string]string),
+			}
+			groups[key] = group
+		}
+		group.addReference(finding.TemplateID, finding.URL)
+	}
+
+	out := make([]Finding, 0, len(findings))
+	emitted := make(map[string]bool)
+	for _, finding := range findings {
+		key, ok := procEnvironmentAggregationKey(finding)
+		if !ok {
+			out = append(out, finding)
+			continue
+		}
+		group := groups[key]
+		if group == nil || len(group.refOrder) <= 1 {
+			out = append(out, finding)
+			continue
+		}
+		if emitted[key] {
+			continue
+		}
+		emitted[key] = true
+		group.finding.References = group.refOrder
+		if len(group.refOrder) == 1 {
+			group.finding.URL = group.refURLs[group.refOrder[0]]
+		}
+		out = append(out, group.finding)
+	}
+	return out
+}
+
+func procEnvironmentReferenceKey(f Finding) (string, bool) {
+	if !strings.EqualFold(f.Source, "proc") {
+		return "", false
+	}
+	if !strings.EqualFold(f.Confidence, "medium") && !strings.EqualFold(f.Confidence, "high") {
+		return "", false
+	}
+	if f.TemplateID == "" || f.TemplateID == "filesystem" || f.TemplateID == "process" {
+		return "", false
+	}
+	if f.Location == "" || f.Evidence == "" {
+		return "", false
+	}
+	return strings.Join([]string{f.Source, f.Location, f.Evidence}, "\x00"), true
+}
+
+func procEnvironmentAggregationKey(f Finding) (string, bool) {
+	if !strings.EqualFold(f.Source, "proc") || !strings.EqualFold(f.Confidence, "medium") {
+		return "", false
+	}
+	if f.TemplateID == "" || f.TemplateID == "filesystem" {
+		return "", false
+	}
+	if f.Location == "" || f.Evidence == "" {
+		return "", false
+	}
+	return strings.Join([]string{f.Source, f.Location, f.Evidence}, "\x00"), true
+}
+
+func neutralProcEnvironmentFinding(f Finding) Finding {
+	return Finding{
+		TemplateID:     "process",
+		CredentialID:   "environment-variable",
+		Origin:         OriginObservation,
+		Product:        "Process environment",
+		Credential:     "Environment variable",
+		Source:         "proc",
+		Confidence:     "medium",
+		Location:       f.Location,
+		CredentialType: procEnvironmentCredentialType(f),
+		Evidence:       f.Evidence,
+	}
+}
+
+func procEnvironmentCredentialType(f Finding) string {
+	envName := procEnvironmentName(f.Location)
+	switch {
+	case containsAnyToken(envName, "PASSWORD", "PASSWD", "PASS", "PWD"):
+		return "password"
+	case containsAnyToken(envName, "API_KEY", "APIKEY"):
+		return "api_key"
+	case containsAnyToken(envName, "ACCESS_TOKEN"):
+		return "access_token"
+	case containsAnyToken(envName, "REFRESH_TOKEN"):
+		return "refresh_token"
+	case containsAnyToken(envName, "TOKEN"):
+		return "token"
+	case containsAnyToken(envName, "SECRET"):
+		return "secret_value"
+	case containsAnyToken(envName, "CONNECTION_STRING", "DATABASE_URL", "DB_URL"):
+		return "connection_string"
+	}
+	if strings.TrimSpace(f.CredentialType) != "" {
+		return f.CredentialType
+	}
+	return "environment"
+}
+
+func procEnvironmentName(location string) string {
+	const marker = " env="
+	idx := strings.LastIndex(location, marker)
+	if idx < 0 {
+		return ""
+	}
+	return strings.ToUpper(strings.TrimSpace(location[idx+len(marker):]))
+}
+
+func containsAnyToken(value string, tokens ...string) bool {
+	value = strings.ToUpper(value)
+	for _, token := range tokens {
+		if strings.Contains(value, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *procEnvironmentSlot) addReference(reference, url string) {
+	reference = strings.TrimSpace(reference)
+	if reference == "filesystem" {
+		return
+	}
+	if reference == "" || p.refSeen[reference] {
+		return
+	}
+	p.refSeen[reference] = true
+	p.refURLs[reference] = url
+	p.refOrder = append(p.refOrder, reference)
 }
 
 func aggregateInfoFindings(findings []Finding) []Finding {

@@ -93,6 +93,29 @@ func TestWriteTextReferences(t *testing.T) {
 	}
 }
 
+func TestWriteTextProcEnvironmentReferences(t *testing.T) {
+	var out bytes.Buffer
+	err := WriteText(&out, []scanner.Finding{
+		{
+			TemplateID:     "process",
+			CredentialID:   "environment-variable",
+			Source:         "proc",
+			Confidence:     "medium",
+			Location:       "pid=1460 comm=python env=DB_PASSWORD",
+			CredentialType: "password",
+			Evidence:       "chan****word",
+			References:     []string{"microsoft-sql-server", "wikijs"},
+		},
+	}, TextOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "[process:environment-variable] [proc] [medium] [pid=1460 comm=python env=DB_PASSWORD] [password] [chan****word] [referenced by 2 templates]\n"
+	if out.String() != want {
+		t.Fatalf("unexpected output\nwant %q\n got %q", want, out.String())
+	}
+}
+
 func TestWriteTextOmitsEmptyTail(t *testing.T) {
 	var out bytes.Buffer
 	err := WriteText(&out, []scanner.Finding{
