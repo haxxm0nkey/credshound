@@ -1478,10 +1478,11 @@ mcpServers:
 }
 
 func TestEmbeddedBuiltinChecksLoad(t *testing.T) {
-	checks, err := loadBuiltinFileChecks(builtinChecksYAML)
+	knowledge, err := loadBuiltinKnowledge(builtinChecksYAML)
 	if err != nil {
 		t.Fatal(err)
 	}
+	checks := knowledge.Checks
 	ids := make(map[string]bool)
 	for _, check := range checks {
 		ids[check.ID] = true
@@ -1542,6 +1543,18 @@ func TestEmbeddedBuiltinChecksLoad(t *testing.T) {
 	}
 	if len(sshCheck.ExcludeNames) == 0 {
 		t.Fatalf("expected SSH private key builtin exclude names")
+	}
+	if !containsString(knowledge.CrossCheckTargets.Paths, ".env") {
+		t.Fatalf("expected cross-check targets to include .env, got %+v", knowledge.CrossCheckTargets.Paths)
+	}
+	if !containsString(knowledge.CrossCheckTargets.Paths, `%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt`) {
+		t.Fatalf("expected cross-check targets to include PowerShell history, got %+v", knowledge.CrossCheckTargets.Paths)
+	}
+	if !containsString(knowledge.SemanticTargets.AIMCP.Paths, ".cursor/mcp.json") {
+		t.Fatalf("expected AI/MCP semantic targets to include Cursor MCP config, got %+v", knowledge.SemanticTargets.AIMCP.Paths)
+	}
+	if !containsString(knowledge.SemanticTargets.AIMCP.GlobPaths, ".claude/backups/*.json") {
+		t.Fatalf("expected AI/MCP semantic targets to include Claude backup glob, got %+v", knowledge.SemanticTargets.AIMCP.GlobPaths)
 	}
 }
 

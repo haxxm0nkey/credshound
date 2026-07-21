@@ -101,72 +101,11 @@ func semanticAIConfigTargets(ctx context.Context, opts Options) ([]string, error
 }
 
 func semanticAIConfigPaths() []string {
-	return []string{
-		".mcp.json",
-		".claude/settings.json",
-		".cline/agents.yaml",
-		".cline/mcp.json",
-		".codex/config.toml",
-		".codex/mcp.json",
-		".continue/config.json",
-		".continue/config.yaml",
-		".continue/config.yml",
-		".cursor/mcp.json",
-		".gemini/settings.json",
-		".opencode.json",
-		".windsurf/mcp.json",
-		"~/Library/Application Support/Claude/claude_desktop_config.json",
-		"~/.claude.json",
-		"~/.claude/settings.json",
-		"~/.cline/data/settings/cline_mcp_settings.json",
-		"~/.codex/auth.json",
-		"~/.codex/config.toml",
-		"~/.codex/mcp.json",
-		"~/.config/Claude/claude_desktop_config.json",
-		"~/.config/cursor/mcp.json",
-		"~/.config/github-copilot/hosts.json",
-		"~/.config/opencode/opencode.json",
-		"~/.config/windsurf/mcp_config.json",
-		"~/.continue/config.json",
-		"~/.continue/config.yaml",
-		"~/.continue/config.yml",
-		"~/.cursor/mcp.json",
-		"~/.gemini/oauth_creds.json",
-		"~/.gemini/settings.json",
-		"~/.hermes/auth.json",
-		"~/.hermes/config.yaml",
-		"~/.opencode.json",
-		"~/.windsurf/mcp.json",
-		"%APPDATA%\\Claude\\claude_desktop_config.json",
-		"%APPDATA%\\Cursor\\User\\mcp.json",
-		"%APPDATA%\\Code\\User\\globalStorage\\saoudrizwan.claude-dev\\settings\\cline_mcp_settings.json",
-		"%APPDATA%\\Codeium\\Windsurf\\mcp_config.json",
-		"%USERPROFILE%\\.claude.json",
-		"%USERPROFILE%\\.claude\\settings.json",
-		"%USERPROFILE%\\.cline\\data\\settings\\cline_mcp_settings.json",
-		"%USERPROFILE%\\.codex\\auth.json",
-		"%USERPROFILE%\\.codex\\config.toml",
-		"%USERPROFILE%\\.codex\\mcp.json",
-		"%USERPROFILE%\\.continue\\config.json",
-		"%USERPROFILE%\\.continue\\config.yaml",
-		"%USERPROFILE%\\.cursor\\mcp.json",
-		"%USERPROFILE%\\.gemini\\oauth_creds.json",
-		"%USERPROFILE%\\.gemini\\settings.json",
-		"%USERPROFILE%\\.hermes\\auth.json",
-		"%USERPROFILE%\\.hermes\\config.yaml",
-		"%USERPROFILE%\\.opencode.json",
-	}
+	return builtinKnowledgeData.SemanticTargets.AIMCP.Paths
 }
 
 func semanticAIConfigGlobPaths() []string {
-	return []string{
-		".claude/backups/*.json",
-		".continue/mcpServers/*.json",
-		"~/.claude/backups/*.json",
-		"~/.continue/mcpServers/*.json",
-		"%USERPROFILE%\\.claude\\backups\\*.json",
-		"%USERPROFILE%\\.continue\\mcpServers\\*.json",
-	}
+	return builtinKnowledgeData.SemanticTargets.AIMCP.GlobPaths
 }
 
 func expandSemanticGlobTargets(rawPath string, opts Options) ([]string, error) {

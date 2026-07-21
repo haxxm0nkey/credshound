@@ -44,47 +44,65 @@ type builtinFileCheckData struct {
 }
 
 type builtinFileCheckSet struct {
-	Checks []builtinFileCheckData `yaml:"checks"`
+	Checks            []builtinFileCheckData   `yaml:"checks"`
+	CrossCheckTargets builtinTargetSetData     `yaml:"cross_check_targets"`
+	SemanticTargets   builtinSemanticTargetSet `yaml:"semantic_targets"`
+}
+
+type builtinTargetSetData struct {
+	Paths     []string `yaml:"paths"`
+	GlobPaths []string `yaml:"glob_paths"`
+}
+
+type builtinSemanticTargetSet struct {
+	AIMCP builtinTargetSetData `yaml:"ai_mcp"`
+}
+
+type builtinKnowledge struct {
+	Checks            []builtinFileCheck
+	CrossCheckTargets builtinTargetSetData
+	SemanticTargets   builtinSemanticTargetSet
 }
 
 //go:embed builtin_checks.yaml
 var builtinChecksYAML []byte
 
-var builtinFileChecks = mustLoadBuiltinFileChecks(builtinChecksYAML)
+var builtinKnowledgeData = mustLoadBuiltinKnowledge(builtinChecksYAML)
+var builtinFileChecks = builtinKnowledgeData.Checks
 
-func mustLoadBuiltinFileChecks(data []byte) []builtinFileCheck {
-	checks, err := loadBuiltinFileChecks(data)
+func mustLoadBuiltinKnowledge(data []byte) builtinKnowledge {
+	knowledge, err := loadBuiltinKnowledge(data)
 	if err != nil {
 		panic(err)
 	}
-	return checks
+	return knowledge
 }
 
-func loadBuiltinFileChecks(data []byte) ([]builtinFileCheck, error) {
+func loadBuiltinKnowledge(data []byte) (builtinKnowledge, error) {
 	var raw builtinFileCheckSet
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse builtin checks: %w", err)
+		return builtinKnowledge{}, fmt.Errorf("parse builtin checks: %w", err)
 	}
 	if len(raw.Checks) == 0 {
-		return nil, fmt.Errorf("parse builtin checks: no checks defined")
+		return builtinKnowledge{}, fmt.Errorf("parse builtin checks: no checks defined")
 	}
 
 	checks := make([]builtinFileCheck, 0, len(raw.Checks))
 	for _, item := range raw.Checks {
 		if item.ID == "" {
-			return nil, fmt.Errorf("parse builtin checks: check id is required")
+			return builtinKnowledge{}, fmt.Errorf("parse builtin checks: check id is required")
 		}
 		if item.Name == "" {
-			return nil, fmt.Errorf("parse builtin checks: check %q name is required", item.ID)
+			return builtinKnowledge{}, fmt.Errorf("parse builtin checks: check %q name is required", item.ID)
 		}
 		if item.CredentialType == "" {
-			return nil, fmt.Errorf("parse builtin checks: check %q type is required", item.ID)
+			return builtinKnowledge{}, fmt.Errorf("parse builtin checks: check %q type is required", item.ID)
 		}
 		if len(item.Paths) == 0 {
-			return nil, fmt.Errorf("parse builtin checks: check %q paths are required", item.ID)
+			return builtinKnowledge{}, fmt.Errorf("parse builtin checks: check %q paths are required", item.ID)
 		}
 		if len(item.Patterns) == 0 {
-			return nil, fmt.Errorf("parse builtin checks: check %q patterns are required", item.ID)
+			return builtinKnowledge{}, fmt.Errorf("parse builtin checks: check %q patterns are required", item.ID)
 		}
 
 		check := builtinFileCheck{
@@ -104,13 +122,23 @@ func loadBuiltinFileChecks(data []byte) ([]builtinFileCheck, error) {
 		for _, pattern := range item.Patterns {
 			re, err := regexp.Compile(pattern)
 			if err != nil {
-				return nil, fmt.Errorf("parse builtin checks: check %q pattern %q: %w", item.ID, pattern, err)
+				return builtinKnowledge{}, fmt.Errorf("parse builtin checks: check %q pattern %q: %w", item.ID, pattern, err)
 			}
 			check.Patterns = append(check.Patterns, re)
 		}
 		checks = append(checks, check)
 	}
-	return checks, nil
+	if len(raw.CrossCheckTargets.Paths) == 0 {
+		return builtinKnowledge{}, fmt.Errorf("parse builtin checks: cross_check_targets.paths are required")
+	}
+	if len(raw.SemanticTargets.AIMCP.Paths) == 0 {
+		return builtinKnowledge{}, fmt.Errorf("parse builtin checks: semantic_targets.ai_mcp.paths are required")
+	}
+	return builtinKnowledge{
+		Checks:            checks,
+		CrossCheckTargets: raw.CrossCheckTargets,
+		SemanticTargets:   raw.SemanticTargets,
+	}, nil
 }
 
 func builtinTemplateCrossCheckTargets(ctx context.Context, opts Options) ([]string, error) {
