@@ -157,6 +157,11 @@ func scanBuiltinFiles(ctx context.Context, opts Options) ([]Finding, error) {
 			findings = append(findings, fileFindings...)
 		}
 	}
+	semanticFindings, err := scanSemanticAIConfigs(ctx, opts)
+	if err != nil {
+		return findings, err
+	}
+	findings = append(findings, semanticFindings...)
 	return findings, nil
 }
 
@@ -313,18 +318,19 @@ func builtinInfoFinding(location string) Finding {
 
 func builtinFinding(check builtinFileCheck, location, evidence string, opts Options) Finding {
 	return Finding{
-		TemplateID:     "filesystem",
-		CredentialID:   check.ID,
-		Origin:         OriginBuiltin,
-		Product:        check.Product,
-		Vendor:         check.Vendor,
-		Category:       check.Category,
-		Credential:     check.Name,
-		Source:         "file",
-		Confidence:     "high",
-		Location:       location,
-		CredentialType: check.CredentialType,
-		Evidence:       redact(evidence, opts.ShowSecrets),
+		TemplateID:        "filesystem",
+		CredentialID:      check.ID,
+		Origin:            OriginBuiltin,
+		Product:           check.Product,
+		Vendor:            check.Vendor,
+		Category:          check.Category,
+		Credential:        check.Name,
+		Source:            "file",
+		Confidence:        "high",
+		Location:          location,
+		CredentialType:    check.CredentialType,
+		Evidence:          redact(evidence, opts.ShowSecrets),
+		SecretFingerprint: fingerprintSecret(evidence, opts),
 	}
 }
 

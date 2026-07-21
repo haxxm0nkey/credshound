@@ -16,19 +16,16 @@ import (
 const bloodHoundSourceKind = "CredsHound"
 
 const (
-	bloodHoundKindHost        = "CHHost"
-	bloodHoundKindLocation    = "CHLocation"
-	bloodHoundKindLocalUser   = "CHLocalUser"
-	bloodHoundKindUserProfile = "CHUserProfile"
-	bloodHoundKindCreds       = "CHCreds"
-	bloodHoundKindObservation = "CHObservation"
-	bloodHoundKindProduct     = "CHProduct"
+	bloodHoundKindHost       = "CHHost"
+	bloodHoundKindLocalUser  = "CHLocalUser"
+	bloodHoundKindExposure   = "CHExposure"
+	bloodHoundKindCredential = "CHCredential"
+	bloodHoundKindService    = "CHService"
 
-	bloodHoundEdgeContainsLocation = "CHContainsLocation"
-	bloodHoundEdgeContainsCreds    = "CHContainsCreds"
-	bloodHoundEdgeMayAuthenticate  = "CHMayAuthenticateTo"
-	bloodHoundEdgeHasLocalUser     = "CHHasLocalUser"
-	bloodHoundEdgeHasUserProfile   = "CHHasUserProfile"
+	bloodHoundEdgeHasLocalUser      = "CHHasLocalUser"
+	bloodHoundEdgeHasExposure       = "CHHasExposure"
+	bloodHoundEdgeRevealsCredential = "CHRevealsCredential"
+	bloodHoundEdgeAuthenticatesTo   = "CHAuthenticatesTo"
 )
 
 type bloodHoundPayload struct {
@@ -52,9 +49,10 @@ type bloodHoundNode struct {
 }
 
 type bloodHoundEdge struct {
-	Kind  string             `json:"kind"`
-	Start bloodHoundEndpoint `json:"start"`
-	End   bloodHoundEndpoint `json:"end"`
+	Kind       string             `json:"kind"`
+	Start      bloodHoundEndpoint `json:"start"`
+	End        bloodHoundEndpoint `json:"end"`
+	Properties map[string]string  `json:"properties,omitempty"`
 }
 
 type bloodHoundEndpoint struct {
@@ -89,102 +87,129 @@ func BloodHoundPayload(findings []scanner.Finding) bloodHoundPayload {
 	})
 
 	for _, finding := range findings {
-		locationValue := findingLocationValue(finding)
-		locationID := bloodHoundID("location", finding.Source, locationValue)
-		findingID := bloodHoundID("finding", finding.TemplateID, finding.CredentialID, finding.Source, finding.Location, finding.Evidence)
-
-		addBloodHoundNode(&payload.Graph.Nodes, seenNodes, bloodHoundNode{
-			ID:    locationID,
-			Kinds: []string{bloodHoundKindLocation},
-			Properties: map[string]string{
-				"name":        locationValue,
-				"displayname": locationValue,
-				"source":      finding.Source,
-				"location":    locationValue,
-			},
+		locationValue, line := findingLocationParts(finding)
+		exposureID := bloodHoundExposureID(finding.Source, locationValue)
+		exposureProperties := compactBloodHoundProperties(map[string]string{
+			"name":        bloodHoundExposureName(finding.Source, locationValue),
+			"displayname": bloodHoundExposureName(finding.Source, locationValue),
+			"source":      finding.Source,
+			"location":    locationValue,
 		})
 
 		if finding.Source == "file" {
 			if profile, ok := inferUserProfile(locationValue); ok {
 				localUserID := bloodHoundID("localuser", host.ID, profile.Username)
-				profileID := bloodHoundID("profile", host.ID, profile.Path)
 
 				addBloodHoundNode(&payload.Graph.Nodes, seenNodes, bloodHoundNode{
 					ID:    localUserID,
 					Kinds: []string{bloodHoundKindLocalUser},
 					Properties: map[string]string{
-						"name":        host.Name + "\\" + profile.Username,
-						"displayname": host.Name + "\\" + profile.Username,
-						"username":    profile.Username,
-						"hostname":    host.Name,
+						"name":         host.Name + "\\" + profile.Username,
+						"displayname":  host.Name + "\\" + profile.Username,
+						"username":     profile.Username,
+						"hostname":     host.Name,
+						"profile_path": profile.Path,
 					},
 				})
-				addBloodHoundNode(&payload.Graph.Nodes, seenNodes, bloodHoundNode{
-					ID:    profileID,
-					Kinds: []string{bloodHoundKindUserProfile},
-					Properties: map[string]string{
-						"name":        profile.Path,
-						"displayname": profile.Path,
-						"path":        profile.Path,
-						"username":    profile.Username,
-						"hostname":    host.Name,
-					},
-				})
+				exposureProperties["username"] = profile.Username
+				exposureProperties["profile_path"] = profile.Path
 				addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeHasLocalUser, host.ID, localUserID)
-				addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeHasUserProfile, localUserID, profileID)
-				addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeContainsLocation, profileID, locationID)
+				addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeHasExposure, localUserID, exposureID)
 			} else {
-				addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeContainsLocation, host.ID, locationID)
+				addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeHasExposure, host.ID, exposureID)
 			}
 		} else {
-			addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeContainsLocation, host.ID, locationID)
+			addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeHasExposure, host.ID, exposureID)
 		}
 
 		addBloodHoundNode(&payload.Graph.Nodes, seenNodes, bloodHoundNode{
-			ID:    findingID,
-			Kinds: bloodHoundFindingKinds(finding),
-			Properties: compactBloodHoundProperties(map[string]string{
-				"name":            bloodHoundFindingName(finding),
-				"displayname":     bloodHoundFindingName(finding),
-				"template_id":     finding.TemplateID,
-				"credential_id":   finding.CredentialID,
-				"detector_id":     finding.TemplateID + ":" + finding.CredentialID,
-				"detector_name":   finding.Credential,
-				"origin":          finding.Origin,
-				"product":         finding.Product,
-				"vendor":          finding.Vendor,
-				"category":        finding.Category,
-				"credential":      finding.Credential,
-				"source":          finding.Source,
-				"confidence":      finding.Confidence,
-				"location":        finding.Location,
-				"credential_type": finding.CredentialType,
-				"evidence":        finding.Evidence,
-				"url":             finding.URL,
-				"references":      strings.Join(finding.References, ","),
-				"reference_count": fmt.Sprintf("%d", len(finding.References)),
-			}),
+			ID:         exposureID,
+			Kinds:      []string{bloodHoundKindExposure},
+			Properties: exposureProperties,
 		})
 
-		addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeContainsCreds, locationID, findingID)
-		if isBloodHoundCredsFinding(finding) {
-			productID := bloodHoundProductID(finding)
+		if isBloodHoundCredentialFinding(finding) {
+			credentialID := bloodHoundCredentialID(finding)
 			addBloodHoundNode(&payload.Graph.Nodes, seenNodes, bloodHoundNode{
-				ID:    productID,
-				Kinds: []string{bloodHoundKindProduct},
+				ID:    credentialID,
+				Kinds: []string{bloodHoundKindCredential},
 				Properties: compactBloodHoundProperties(map[string]string{
-					"name":        bloodHoundProductName(finding),
-					"displayname": bloodHoundProductName(finding),
-					"product_id":  bloodHoundProductKey(finding),
-					"vendor":      finding.Vendor,
-					"category":    finding.Category,
-					"url":         finding.URL,
+					"name":               bloodHoundCredentialName(finding),
+					"displayname":        bloodHoundCredentialName(finding),
+					"credential_type":    finding.CredentialType,
+					"confidence":         finding.Confidence,
+					"secret_fingerprint": finding.SecretFingerprint,
 				}),
 			})
-			addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeMayAuthenticate, findingID, productID)
+			addBloodHoundEdgeWithProperties(&payload.Graph.Edges, seenEdges, bloodHoundEdgeRevealsCredential, exposureID, credentialID, bloodHoundFindingProperties(finding, line))
+			if isBloodHoundServiceFinding(finding) {
+				serviceID := bloodHoundServiceID(finding)
+				addBloodHoundNode(&payload.Graph.Nodes, seenNodes, bloodHoundNode{
+					ID:    serviceID,
+					Kinds: []string{bloodHoundKindService},
+					Properties: compactBloodHoundProperties(map[string]string{
+						"name":        bloodHoundServiceName(finding),
+						"displayname": bloodHoundServiceName(finding),
+						"service_id":  bloodHoundServiceKey(finding),
+						"vendor":      finding.Vendor,
+						"category":    finding.Category,
+						"url":         finding.URL,
+					}),
+				})
+				addBloodHoundEdge(&payload.Graph.Edges, seenEdges, bloodHoundEdgeAuthenticatesTo, credentialID, serviceID)
+			}
 		}
 	}
 	return payload
+}
+
+func bloodHoundExposureID(source, location string) string {
+	return bloodHoundID("exposure", source, location)
+}
+
+func bloodHoundCredentialID(finding scanner.Finding) string {
+	if finding.SecretFingerprint != "" {
+		return bloodHoundID("credential", finding.CredentialType, finding.SecretFingerprint)
+	}
+	return bloodHoundID("credential", finding.TemplateID, finding.CredentialID, finding.Source, finding.Location, finding.Evidence)
+}
+
+func bloodHoundCredentialName(finding scanner.Finding) string {
+	name := finding.TemplateID + ":" + finding.CredentialID
+	if strings.TrimSpace(finding.Product) != "" {
+		name = strings.ToLower(strings.ReplaceAll(finding.Product, " ", "-")) + ":" + finding.CredentialID
+	}
+	return name
+}
+
+func bloodHoundExposureName(source, location string) string {
+	if strings.TrimSpace(location) != "" {
+		return location
+	}
+	return source
+}
+
+func bloodHoundFindingProperties(finding scanner.Finding, line string) map[string]string {
+	return compactBloodHoundProperties(map[string]string{
+		"template_id":     finding.TemplateID,
+		"credential_id":   finding.CredentialID,
+		"detector_id":     finding.TemplateID + ":" + finding.CredentialID,
+		"detector_name":   finding.Credential,
+		"origin":          finding.Origin,
+		"product":         finding.Product,
+		"vendor":          finding.Vendor,
+		"category":        finding.Category,
+		"credential":      finding.Credential,
+		"source":          finding.Source,
+		"confidence":      finding.Confidence,
+		"raw_location":    finding.Location,
+		"line":            line,
+		"credential_type": finding.CredentialType,
+		"evidence":        finding.Evidence,
+		"url":             finding.URL,
+		"references":      strings.Join(finding.References, ","),
+		"reference_count": fmt.Sprintf("%d", len(finding.References)),
+	})
 }
 
 type bloodHoundHostContext struct {
@@ -267,50 +292,49 @@ func addBloodHoundNode(nodes *[]bloodHoundNode, seen map[string]bool, node blood
 }
 
 func addBloodHoundEdge(edges *[]bloodHoundEdge, seen map[string]bool, kind, startID, endID string) {
+	addBloodHoundEdgeWithProperties(edges, seen, kind, startID, endID, nil)
+}
+
+func addBloodHoundEdgeWithProperties(edges *[]bloodHoundEdge, seen map[string]bool, kind, startID, endID string, properties map[string]string) {
 	key := kind + "\x00" + startID + "\x00" + endID
 	if seen[key] {
 		return
 	}
 	seen[key] = true
 	*edges = append(*edges, bloodHoundEdge{
-		Kind:  kind,
-		Start: bloodHoundEndpoint{Value: startID, MatchBy: "id"},
-		End:   bloodHoundEndpoint{Value: endID, MatchBy: "id"},
+		Kind:       kind,
+		Start:      bloodHoundEndpoint{Value: startID, MatchBy: "id"},
+		End:        bloodHoundEndpoint{Value: endID, MatchBy: "id"},
+		Properties: properties,
 	})
 }
 
-func bloodHoundFindingKinds(f scanner.Finding) []string {
-	if strings.EqualFold(f.Confidence, "info") || f.Origin == scanner.OriginObservation {
-		return []string{bloodHoundKindObservation}
-	}
-	return []string{bloodHoundKindCreds}
-}
-
-func bloodHoundFindingName(f scanner.Finding) string {
-	id := f.TemplateID + ":" + f.CredentialID
-	if f.Location == "" {
-		return id
-	}
-	return id + " @ " + f.Location
-}
-
-func findingLocationValue(f scanner.Finding) string {
+func findingLocationParts(f scanner.Finding) (string, string) {
 	if f.Source == "file" {
-		location, _ := splitLocationLineForReport(f.Location)
-		return location
+		return splitLocationLineForReport(f.Location)
 	}
-	return f.Location
+	return f.Location, ""
 }
 
-func isBloodHoundCredsFinding(f scanner.Finding) bool {
-	return !strings.EqualFold(f.Confidence, "info") && f.Origin != scanner.OriginObservation
+func isBloodHoundCredentialFinding(f scanner.Finding) bool {
+	return !strings.EqualFold(f.Confidence, "info")
 }
 
-func bloodHoundProductID(f scanner.Finding) string {
-	return bloodHoundID("product", bloodHoundProductKey(f), f.Vendor, f.Category)
+func isBloodHoundServiceFinding(f scanner.Finding) bool {
+	if !isBloodHoundCredentialFinding(f) {
+		return false
+	}
+	if f.TemplateID == "process" || strings.EqualFold(f.Product, "Process environment") {
+		return false
+	}
+	return strings.TrimSpace(f.Product) != "" || (strings.TrimSpace(f.TemplateID) != "" && f.TemplateID != "filesystem")
 }
 
-func bloodHoundProductKey(f scanner.Finding) string {
+func bloodHoundServiceID(f scanner.Finding) string {
+	return bloodHoundID("service", bloodHoundServiceKey(f), f.Vendor, f.Category)
+}
+
+func bloodHoundServiceKey(f scanner.Finding) string {
 	if f.TemplateID != "" && f.TemplateID != "filesystem" {
 		return f.TemplateID
 	}
@@ -320,11 +344,11 @@ func bloodHoundProductKey(f scanner.Finding) string {
 	return "unknown"
 }
 
-func bloodHoundProductName(f scanner.Finding) string {
+func bloodHoundServiceName(f scanner.Finding) string {
 	if strings.TrimSpace(f.Product) != "" {
 		return strings.TrimSpace(f.Product)
 	}
-	return "Unknown product"
+	return "Unknown service"
 }
 
 func compactBloodHoundProperties(properties map[string]string) map[string]string {

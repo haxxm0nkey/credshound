@@ -1354,6 +1354,129 @@ func TestDedupeHighFindingsBySecretPrefersTemplateFinding(t *testing.T) {
 	}
 }
 
+func TestSemanticMCPConfigFindsEnvSecretsInlineSecretsAndReferences(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, ".cursor", "mcp.json")
+	writeTestFile(t, configPath, `{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github", "--token", "ghp_INLINESECRETVALUE12345678901234567890"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_ENVSECRETVALUE123456789012345678901",
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+      }
+    }
+  }
+}`)
+
+	findings, err := Scan(context.Background(), nil, Options{
+		Roots:          []string{root},
+		MaxFileSize:    4096,
+		EnableBuiltins: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	envSecret := findingByID(findings, "filesystem", "ai-mcp-env-secret")
+	if envSecret == nil {
+		t.Fatalf("expected semantic MCP env secret finding, got %+v", findings)
+	}
+	if envSecret.Origin != OriginBuiltin || envSecret.Confidence != "high" {
+		t.Fatalf("unexpected env secret metadata: %+v", envSecret)
+	}
+	if envSecret.Location != configPath+":7" {
+		t.Fatalf("unexpected env secret location %q", envSecret.Location)
+	}
+
+	inlineSecret := findingByID(findings, "filesystem", "ai-mcp-inline-secret")
+	if inlineSecret == nil {
+		t.Fatalf("expected semantic MCP inline secret finding, got %+v", findings)
+	}
+	if inlineSecret.Location != configPath+":5" {
+		t.Fatalf("unexpected inline secret location %q", inlineSecret.Location)
+	}
+
+	envReference := findingByID(findings, "filesystem", "ai-mcp-env-reference")
+	if envReference == nil {
+		t.Fatalf("expected semantic MCP env reference finding, got %+v", findings)
+	}
+	if envReference.Confidence != "info" || envReference.Evidence != "${OPENAI_API_KEY}" {
+		t.Fatalf("unexpected env reference finding: %+v", envReference)
+	}
+}
+
+func TestSemanticMCPConfigScansClaudeBackups(t *testing.T) {
+	root := t.TempDir()
+	backupPath := filepath.Join(root, ".claude", "backups", "old.json")
+	writeTestFile(t, backupPath, `{
+  "mcpServers": {
+    "slack": {
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-123456789012-abcdefghijklmnop"
+      }
+    }
+  }
+}`)
+
+	findings, err := Scan(context.Background(), nil, Options{
+		Roots:          []string{root},
+		MaxFileSize:    4096,
+		EnableBuiltins: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finding := findingByID(findings, "filesystem", "ai-mcp-env-secret")
+	if finding == nil {
+		t.Fatalf("expected semantic MCP env secret from Claude backup, got %+v", findings)
+	}
+	if finding.Location != backupPath+":5" {
+		t.Fatalf("unexpected backup finding location %q", finding.Location)
+	}
+}
+
+func TestSemanticContinueYAMLMCPConfig(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, ".continue", "config.yaml")
+	writeTestFile(t, configPath, `name: local
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: postgres
+    command: uvx
+    env:
+      DATABASE_URL: ${DATABASE_URL}
+      API_KEY: live-secret-token-123456
+`)
+
+	findings, err := Scan(context.Background(), nil, Options{
+		Roots:          []string{root},
+		MaxFileSize:    4096,
+		EnableBuiltins: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	envSecret := findingByID(findings, "filesystem", "ai-mcp-env-secret")
+	if envSecret == nil {
+		t.Fatalf("expected semantic MCP env secret from Continue YAML, got %+v", findings)
+	}
+	if envSecret.Location != configPath+":9" {
+		t.Fatalf("unexpected YAML env secret location %q", envSecret.Location)
+	}
+	envReference := findingByID(findings, "filesystem", "ai-mcp-env-reference")
+	if envReference == nil {
+		t.Fatalf("expected semantic MCP env reference from Continue YAML, got %+v", findings)
+	}
+	if envReference.Location != configPath+":8" {
+		t.Fatalf("unexpected YAML env reference location %q", envReference.Location)
+	}
+}
+
 func TestEmbeddedBuiltinChecksLoad(t *testing.T) {
 	checks, err := loadBuiltinFileChecks(builtinChecksYAML)
 	if err != nil {
@@ -1536,6 +1659,83 @@ func TestExpandWindowsEnv(t *testing.T) {
 	want := `C:\Users\alice\AppData\Roaming\Example\config.yml`
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestScanWSLTranslatedWindowsProfilePath(t *testing.T) {
+	mountRoot := t.TempDir()
+	t.Setenv("USER", "alice")
+	configPath := filepath.Join(mountRoot, "c", "Users", "alice", "AppData", "Roaming", "Example", "config.yml")
+	writeTestFile(t, configPath, `api_key="abcd1234abcd1234"`)
+
+	findings, err := Scan(context.Background(), []templates.Entry{
+		{
+			ID:   "example-product",
+			Name: "Example Product",
+			Credentials: []templates.Credential{
+				{
+					ID:   "windows-appdata-token",
+					Name: "Windows AppData token",
+					Type: "api_token",
+					Location: []templates.Location{
+						{Type: "config_file", Path: `%APPDATA%\Example\config.yml`},
+					},
+					LooksLike: []templates.LooksLike{
+						{Pattern: `(?i)api[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9]{16,}['"]?`},
+					},
+				},
+			},
+		},
+	}, Options{
+		WSLMountRoot: mountRoot,
+		MaxFileSize:  1024,
+		URLBase:      "https://lolcreds.haxx.it",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finding := findByConfidence(findings, "high")
+	if finding == nil {
+		t.Fatalf("expected WSL-translated Windows path finding, got %+v", findings)
+	}
+	wantLocation := configPath + ":1"
+	if finding.Location != wantLocation {
+		t.Fatalf("expected location %q, got %q", wantLocation, finding.Location)
+	}
+}
+
+func TestScanBuiltinPowerShellHistoryViaWSLAppData(t *testing.T) {
+	mountRoot := t.TempDir()
+	t.Setenv("USER", "alice")
+	historyPath := filepath.Join(mountRoot, "c", "Users", "alice", "AppData", "Roaming", "Microsoft", "Windows", "PowerShell", "PSReadLine", "ConsoleHost_history.txt")
+	writeTestFile(t, historyPath, `$env:OPENAI_API_KEY="sk-testvalue1234567890abcdefghijklmnopqrstuvwxyz"`)
+
+	findings, err := Scan(context.Background(), nil, Options{
+		WSLMountRoot:   mountRoot,
+		EnableBuiltins: true,
+		MaxFileSize:    1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finding := findingByID(findings, "filesystem", "shell-history-credential")
+	if finding == nil {
+		t.Fatalf("expected WSL PowerShell history builtin finding, got %+v", findings)
+	}
+	wantLocation := historyPath + ":1"
+	if finding.Location != wantLocation {
+		t.Fatalf("expected location %q, got %q", wantLocation, finding.Location)
+	}
+}
+
+func TestExpandWSLFileTargetsForWindowsDrivePath(t *testing.T) {
+	mountRoot := t.TempDir()
+	got := expandWSLFileTargets(`C:\Users\alice\.git-credentials`, Options{WSLMountRoot: mountRoot})
+	want := filepath.Join(mountRoot, "c", "Users", "alice", ".git-credentials")
+	if !sameStrings(got, []string{want}) {
+		t.Fatalf("expected %q, got %+v", want, got)
 	}
 }
 

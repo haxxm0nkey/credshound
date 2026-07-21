@@ -21,7 +21,9 @@ It uses [LOLCreds](https://lolcreds.haxx.it/) template data for product-aware ch
 * **Environment variables** (scanning running process environment for exposed keys).
 * **Linux process environments** via `/proc/*/environ` when explicitly enabled.
 * **Configuration files** and project-local configs.
+* **WSL-mounted Windows profile paths** such as `%APPDATA%`, `%LOCALAPPDATA%`, `%USERPROFILE%`, and `C:\...` paths when running inside WSL.
 * **Common credential artifacts** such as Git credentials, Docker auth config, kubeconfig, shell history (`.bash_history`, `.zsh_history`, PowerShell history), `.netrc`, `.pgpass`, private keys, and similar files.
+* **AI/MCP configuration files** with structured parsing for `mcpServers` env blocks, inline command tokens, `${ENV_VAR}` references, and backup files such as `.claude/backups/*.json`.
 
 ---
 
@@ -32,10 +34,16 @@ Instead of throwing messy text logs at you, CredsHound can map local exposures d
 When imported into BloodHound, it visualizes the exact blast radius of a compromised host or build server:
 
 ```text
-CHHost ➔ CHLocalUser ➔ CHUserProfile ➔ CHLocation ➔ CHCreds ➔ CHProduct
+CHHost ➔ CHLocalUser ➔ CHExposure ➔ CHCredential ➔ CHService
 ```
 
 See [BloodHound integration docs](docs/integrations/bloodhound.md) for import notes, graph model details, useful Cypher queries, and optional icon guidance.
+
+Register CredsHound icons and saved queries in BloodHound:
+
+```bash
+BLOODHOUND_URL=http://localhost:8080 BLOODHOUND_TOKEN=... credshound -bh-setup
+```
 
 ## 📥 Install
 
@@ -109,6 +117,8 @@ Scan current and process environment variables on Linux:
 credshound -sources env,proc
 ```
 
+When CredsHound runs inside WSL, Windows-style template and built-in paths are translated automatically to `/mnt/<drive>/...` where available. This lets one scan catch Linux home artifacts and Windows profile artifacts such as PowerShell history, Docker config, pgpass, and AppData configs.
+
 Filter findings by ID, severity, type, or origin:
 
 ```bash
@@ -127,6 +137,12 @@ Write BloodHound OpenGraph JSON:
 
 ```bash
 credshound -bloodhound -o credshound-bloodhound.json .
+```
+
+Credential fingerprints are stable by default so reuse analysis works across multiple BloodHound imports. For real environments, prefer an org-local key:
+
+```bash
+credshound -fingerprint-key 'shared-lab-key' -bloodhound -o credshound-bloodhound.json .
 ```
 
 Inspect template coverage:

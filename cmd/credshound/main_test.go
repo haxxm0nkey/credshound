@@ -22,7 +22,7 @@ func TestRunRootFlagHelp(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := stdout.String()
-	for _, want := range []string{"credshound [flags] [root...]", "credshound .", "credshound ~/project /etc", "TARGET:", "TEMPLATES:", "SOURCES:", "FILTERING:", "OUTPUT:", "-t, -templates", "-sources", "env,file,proc", "-id LIST", "-eid LIST", "-severity LIST", "-origin LIST", "-j, -jsonl", "-bh, -bloodhound", "-o, -output", "-duc, -disable-update-check", "Skip dirs affect only recursive searches"} {
+	for _, want := range []string{"credshound [flags] [root...]", "credshound .", "credshound ~/project /etc", "TARGET:", "TEMPLATES:", "SOURCES:", "FILTERING:", "OUTPUT:", "INTEGRATIONS:", "-t, -templates", "-sources", "env,file,proc", "-id LIST", "-eid LIST", "-severity LIST", "-origin LIST", "-j, -jsonl", "-bh, -bloodhound", "-bh-setup", "-o, -output", "-fingerprint-key KEY", "-ephemeral-fingerprint", "-duc, -disable-update-check", "Skip dirs affect only recursive searches"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected help output to contain %q, got:\n%s", want, out)
 		}
@@ -65,6 +65,39 @@ func TestRunInspectTemplatesFlagHelp(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunBloodHoundSetupFlagHelp(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	if err := run([]string{"-bh-setup", "-h"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	got := stdout.String()
+	for _, want := range []string{"credshound -bh-setup [flags]", "INTEGRATION:", "BloodHound OpenGraph", "-server URL", "-token TOKEN", "-reset-queries", "BLOODHOUND_URL"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected %q in BloodHound setup help, got:\n%s", want, got)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestPrintRunErrorForBloodHoundSetupUnknownFlagSuggestsHelp(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	err := run([]string{"-bh-setup", "-asdf"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected unknown flag error")
+	}
+	var out bytes.Buffer
+	printRunError(&out, err)
+	if got, want := out.String(), "unknown flag: -asdf\nUse -bh-setup -h for help.\n"; got != want {
+		t.Fatalf("unexpected error output\nwant %q\n got %q", want, got)
 	}
 }
 
@@ -387,6 +420,54 @@ func TestRunJSONLShortFlag(t *testing.T) {
 	}
 }
 
+func TestRunBloodHoundFingerprintKeyFlagIsStable(t *testing.T) {
+	t.Setenv("EXAMPLE_API_TOKEN", "ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+
+	first := runBloodHoundForTest(t, "-fingerprint-key", "shared-test-key")
+	second := runBloodHoundForTest(t, "-fingerprint-key", "shared-test-key")
+	third := runBloodHoundForTest(t, "-fingerprint-key", "other-test-key")
+
+	firstCredential := credentialNodeForTest(t, first)
+	secondCredential := credentialNodeForTest(t, second)
+	thirdCredential := credentialNodeForTest(t, third)
+
+	if firstCredential.ID != secondCredential.ID {
+		t.Fatalf("expected same key to produce same credential ID, got %q and %q", firstCredential.ID, secondCredential.ID)
+	}
+	if firstCredential.Properties["secret_fingerprint"] != secondCredential.Properties["secret_fingerprint"] {
+		t.Fatalf("expected same key to produce same fingerprint, got %q and %q", firstCredential.Properties["secret_fingerprint"], secondCredential.Properties["secret_fingerprint"])
+	}
+	if firstCredential.ID == thirdCredential.ID {
+		t.Fatalf("expected different key to produce different credential ID %q", firstCredential.ID)
+	}
+}
+
+func TestRunBloodHoundDefaultFingerprintKeyIsStable(t *testing.T) {
+	t.Setenv("EXAMPLE_API_TOKEN", "ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+
+	first := credentialNodeForTest(t, runBloodHoundForTest(t))
+	second := credentialNodeForTest(t, runBloodHoundForTest(t))
+
+	if first.ID != second.ID {
+		t.Fatalf("expected default fingerprint key to be stable, got %q and %q", first.ID, second.ID)
+	}
+	if first.Properties["secret_fingerprint"] != second.Properties["secret_fingerprint"] {
+		t.Fatalf("expected default fingerprint to be stable, got %q and %q", first.Properties["secret_fingerprint"], second.Properties["secret_fingerprint"])
+	}
+}
+
+func TestRunBloodHoundEphemeralFingerprintKeyChangesCredentialID(t *testing.T) {
+	t.Setenv("EXAMPLE_API_TOKEN", "ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
+	t.Setenv("CREDSHOUND_FINGERPRINT_KEY", "env-key-that-ephemeral-should-ignore")
+
+	first := credentialNodeForTest(t, runBloodHoundForTest(t, "-ephemeral-fingerprint"))
+	second := credentialNodeForTest(t, runBloodHoundForTest(t, "-ephemeral-fingerprint"))
+
+	if first.ID == second.ID {
+		t.Fatalf("expected ephemeral fingerprint key to change credential ID %q", first.ID)
+	}
+}
+
 func TestRunBloodHoundFlag(t *testing.T) {
 	t.Setenv("EXAMPLE_API_TOKEN", "ex_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890")
 
@@ -429,11 +510,14 @@ func TestRunBloodHoundFlag(t *testing.T) {
 	if len(payload.Graph.Edges) != 3 {
 		t.Fatalf("expected host->location, location->creds, and creds->product edges, got %+v", payload.Graph.Edges)
 	}
-	if !bloodHoundKindsContain(payload.Graph.Nodes, "CHCreds") {
-		t.Fatalf("expected CHCreds node, got %+v", payload.Graph.Nodes)
+	if !bloodHoundKindsContain(payload.Graph.Nodes, "CHExposure") {
+		t.Fatalf("expected CHExposure node, got %+v", payload.Graph.Nodes)
 	}
-	if !bloodHoundKindsContain(payload.Graph.Nodes, "CHProduct") {
-		t.Fatalf("expected CHProduct node, got %+v", payload.Graph.Nodes)
+	if !bloodHoundKindsContain(payload.Graph.Nodes, "CHCredential") {
+		t.Fatalf("expected CHCredential node, got %+v", payload.Graph.Nodes)
+	}
+	if !bloodHoundKindsContain(payload.Graph.Nodes, "CHService") {
+		t.Fatalf("expected CHService node, got %+v", payload.Graph.Nodes)
 	}
 	if bloodHoundKindsContain(payload.Graph.Nodes, "CHDetector") {
 		t.Fatalf("expected no CHDetector node, got %+v", payload.Graph.Nodes)
@@ -449,6 +533,58 @@ func TestRunBloodHoundFlag(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr, got %q", stderr.String())
 	}
+}
+
+type bloodHoundPayloadForTest struct {
+	Graph struct {
+		Nodes []struct {
+			ID         string            `json:"id"`
+			Kinds      []string          `json:"kinds"`
+			Properties map[string]string `json:"properties"`
+		} `json:"nodes"`
+	} `json:"graph"`
+}
+
+func runBloodHoundForTest(t *testing.T, extraArgs ...string) bloodHoundPayloadForTest {
+	t.Helper()
+	args := []string{"-t", "../../testdata/lolcreds-data", "-sources", "env", "-silent", "-bh"}
+	args = append(args, extraArgs...)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := run(args, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+
+	var payload bloodHoundPayloadForTest
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("expected BloodHound JSON output: %v\n%s", err, stdout.String())
+	}
+	return payload
+}
+
+func credentialNodeForTest(t *testing.T, payload bloodHoundPayloadForTest) struct {
+	ID         string            `json:"id"`
+	Kinds      []string          `json:"kinds"`
+	Properties map[string]string `json:"properties"`
+} {
+	t.Helper()
+	for _, node := range payload.Graph.Nodes {
+		for _, kind := range node.Kinds {
+			if kind == "CHCredential" {
+				return node
+			}
+		}
+	}
+	t.Fatalf("expected CHCredential node, got %+v", payload.Graph.Nodes)
+	return struct {
+		ID         string            `json:"id"`
+		Kinds      []string          `json:"kinds"`
+		Properties map[string]string `json:"properties"`
+	}{}
 }
 
 func TestRunRejectsMultipleOutputFormats(t *testing.T) {

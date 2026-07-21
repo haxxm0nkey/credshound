@@ -506,6 +506,9 @@ func expandFileTargets(ctx context.Context, rawPath string, opts Options) ([]str
 		return nil, nil
 	}
 	if runtime.GOOS != "windows" && looksWindowsSpecific(rawPath) {
+		if targets := expandWSLFileTargets(rawPath, opts); len(targets) > 0 {
+			return targets, nil
+		}
 		return nil, nil
 	}
 	expanded := expandWindowsEnv(rawPath)
@@ -528,6 +531,197 @@ func expandFileTargets(ctx context.Context, rawPath string, opts Options) ([]str
 		targets = append(targets, filepath.Clean(filepath.Join(root, expanded)))
 	}
 	return targets, nil
+}
+
+func expandWSLFileTargets(rawPath string, opts Options) []string {
+	mountRoot, ok := wslMountRoot(opts)
+	if !ok {
+		return nil
+	}
+
+	expanded := expandWindowsEnv(rawPath)
+	var candidates []string
+	if translated, ok := windowsPathToWSLPath(expanded, mountRoot); ok {
+		candidates = append(candidates, translated)
+	}
+
+	for _, expandedEnvPath := range expandWindowsEnvForWSL(rawPath, mountRoot) {
+		if translated, ok := windowsPathToWSLPath(expandedEnvPath, mountRoot); ok {
+			candidates = append(candidates, translated)
+			continue
+		}
+		if filepath.IsAbs(expandedEnvPath) {
+			candidates = append(candidates, filepath.Clean(expandedEnvPath))
+		}
+	}
+	return cleanExistingCandidates(candidates)
+}
+
+func wslMountRoot(opts Options) (string, bool) {
+	if strings.TrimSpace(opts.WSLMountRoot) != "" {
+		return filepath.Clean(opts.WSLMountRoot), true
+	}
+	if runtime.GOOS != "linux" || !isWSLRuntime() {
+		return "", false
+	}
+	mountRoot := "/mnt"
+	if info, err := os.Stat(filepath.Join(mountRoot, "c")); err == nil && info.IsDir() {
+		return mountRoot, true
+	}
+	return "", false
+}
+
+func isWSLRuntime() bool {
+	data, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return false
+	}
+	release := strings.ToLower(string(data))
+	return strings.Contains(release, "microsoft") || strings.Contains(release, "wsl")
+}
+
+func windowsPathToWSLPath(value, mountRoot string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 || value[1] != ':' || (value[2] != '\\' && value[2] != '/') {
+		return "", false
+	}
+	drive := value[0]
+	if drive >= 'A' && drive <= 'Z' {
+		drive += 'a' - 'A'
+	}
+	if drive < 'a' || drive > 'z' {
+		return "", false
+	}
+	rest := strings.TrimLeft(value[2:], `\/`)
+	parts := strings.FieldsFunc(rest, func(r rune) bool {
+		return r == '\\' || r == '/'
+	})
+	out := append([]string{mountRoot, string(drive)}, parts...)
+	return filepath.Clean(filepath.Join(out...)), true
+}
+
+func expandWindowsEnvForWSL(rawPath, mountRoot string) []string {
+	envValues := wslWindowsEnvValues(mountRoot)
+	var out []string
+	expandWindowsEnvCandidates(rawPath, envValues, &out)
+	return out
+}
+
+func expandWindowsEnvCandidates(value string, envValues map[string][]string, out *[]string) {
+	start := strings.IndexByte(value, '%')
+	if start < 0 {
+		*out = append(*out, value)
+		return
+	}
+	endRel := strings.IndexByte(value[start+1:], '%')
+	if endRel < 0 {
+		*out = append(*out, value)
+		return
+	}
+	end := start + 1 + endRel
+	name := strings.ToUpper(value[start+1 : end])
+	values := envValues[name]
+	if len(values) == 0 {
+		*out = append(*out, value)
+		return
+	}
+	for _, replacement := range values {
+		expandWindowsEnvCandidates(value[:start]+replacement+value[end+1:], envValues, out)
+	}
+}
+
+func wslWindowsEnvValues(mountRoot string) map[string][]string {
+	values := map[string][]string{
+		"PROGRAMDATA":       {`C:\ProgramData`},
+		"PROGRAMFILES":      {`C:\Program Files`},
+		"PROGRAMFILES(X86)": {`C:\Program Files (x86)`},
+		"SYSTEMROOT":        {`C:\Windows`},
+		"WINDIR":            {`C:\Windows`},
+	}
+
+	if userProfile, ok := os.LookupEnv("USERPROFILE"); ok && strings.TrimSpace(userProfile) != "" {
+		values["USERPROFILE"] = []string{userProfile}
+	}
+	if appData, ok := os.LookupEnv("APPDATA"); ok && strings.TrimSpace(appData) != "" {
+		values["APPDATA"] = []string{appData}
+	}
+	if localAppData, ok := os.LookupEnv("LOCALAPPDATA"); ok && strings.TrimSpace(localAppData) != "" {
+		values["LOCALAPPDATA"] = []string{localAppData}
+	}
+
+	for _, username := range wslWindowsUserCandidates(mountRoot) {
+		profile := `C:\Users\` + username
+		addEnvCandidate(values, "USERPROFILE", profile)
+		addEnvCandidate(values, "APPDATA", profile+`\AppData\Roaming`)
+		addEnvCandidate(values, "LOCALAPPDATA", profile+`\AppData\Local`)
+	}
+	return values
+}
+
+func wslWindowsUserCandidates(mountRoot string) []string {
+	seen := make(map[string]bool)
+	var users []string
+	if user := strings.TrimSpace(os.Getenv("USER")); user != "" {
+		addStringCandidate(&users, seen, user)
+	}
+	if user := strings.TrimSpace(os.Getenv("USERNAME")); user != "" {
+		addStringCandidate(&users, seen, user)
+	}
+
+	usersRoot := filepath.Join(mountRoot, "c", "Users")
+	entries, err := os.ReadDir(usersRoot)
+	if err != nil {
+		return users
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || isWindowsProfileNoise(entry.Name()) {
+			continue
+		}
+		addStringCandidate(&users, seen, entry.Name())
+	}
+	return users
+}
+
+func isWindowsProfileNoise(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "all users", "default", "default user", "desktop.ini", "public":
+		return true
+	default:
+		return false
+	}
+}
+
+func addEnvCandidate(values map[string][]string, name, value string) {
+	current := values[name]
+	for _, existing := range current {
+		if strings.EqualFold(existing, value) {
+			return
+		}
+	}
+	values[name] = append(values[name], value)
+}
+
+func addStringCandidate(values *[]string, seen map[string]bool, value string) {
+	key := strings.ToLower(value)
+	if seen[key] {
+		return
+	}
+	seen[key] = true
+	*values = append(*values, value)
+}
+
+func cleanExistingCandidates(candidates []string) []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	return out
 }
 
 func expandHome(path string) string {

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	bloodhoundintegration "github.com/haxxm0nkey/credshound/internal/integrations/bloodhound"
 	"github.com/haxxm0nkey/credshound/internal/report"
 	"github.com/haxxm0nkey/credshound/internal/scanner"
 	"github.com/haxxm0nkey/credshound/internal/templates"
@@ -86,6 +87,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	switch args[0] {
+	case "-bh-setup":
+		return runBloodHoundSetup(args[1:], stdout)
 	case "inspect-templates":
 		return runInspectTemplates(args[1:], stdout)
 	case "update-templates", "-ut", "-update-templates":
@@ -119,6 +122,8 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 	bloodHoundLong := fs.Bool("bloodhound", false, "write findings as BloodHound OpenGraph JSON")
 	outputShort := fs.String("o", "", "output file to write findings")
 	outputLong := fs.String("output", "", "output file to write findings")
+	fingerprintKey := fs.String("fingerprint-key", "", "stable credential fingerprint key for BloodHound reuse analysis")
+	ephemeralFingerprint := fs.Bool("ephemeral-fingerprint", false, "use a per-scan random fingerprint key")
 	sources := fs.String("sources", "", "comma-separated sources to scan: env,file,proc")
 	excludeSourcesFlag := fs.String("exclude-sources", "", "comma-separated sources to exclude: env,file,proc")
 	includeIDs := fs.String("id", "", "finding IDs to include: template or template:credential")
@@ -247,18 +252,24 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	fingerprintKeyValue := firstNonEmpty(*fingerprintKey, os.Getenv("CREDSHOUND_FINGERPRINT_KEY"))
+	if *ephemeralFingerprint && strings.TrimSpace(*fingerprintKey) == "" {
+		fingerprintKeyValue = ""
+	}
 
 	result, err := scanner.ScanWithStats(ctx, entries, scanner.Options{
-		Roots:          roots,
-		MaxFileSize:    *maxFileSize,
-		Recursive:      *recursive,
-		MaxDepth:       *maxDepth,
-		SkipDirs:       skipDirMap,
-		ShowSecrets:    *showSecrets,
-		URLBase:        "https://lolcreds.haxx.it",
-		EnableBuiltins: true,
-		IncludeSources: includeSources,
-		ExcludeSources: excludeSources,
+		Roots:                roots,
+		MaxFileSize:          *maxFileSize,
+		Recursive:            *recursive,
+		MaxDepth:             *maxDepth,
+		SkipDirs:             skipDirMap,
+		ShowSecrets:          *showSecrets,
+		URLBase:              "https://lolcreds.haxx.it",
+		EnableBuiltins:       true,
+		IncludeSources:       includeSources,
+		ExcludeSources:       excludeSources,
+		FingerprintKey:       fingerprintKeyValue,
+		EphemeralFingerprint: *ephemeralFingerprint,
 	})
 	if err != nil {
 		return err
@@ -307,6 +318,67 @@ func runScan(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "bloodhound":
 		return report.WriteBloodHound(findingsWriter, outputFindings)
+	}
+	return nil
+}
+
+func runBloodHoundSetup(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("-bh-setup", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	server := fs.String("server", "", "BloodHound server URL")
+	username := fs.String("username", "", "BloodHound username")
+	password := fs.String("password", "", "BloodHound password")
+	token := fs.String("token", "", "BloodHound JWT bearer token")
+	noIcons := fs.Bool("no-icons", false, "skip custom node icon setup")
+	noQueries := fs.Bool("no-queries", false, "skip saved query import")
+	resetQueries := fs.Bool("reset-queries", false, "delete existing CredsHound saved queries before import")
+	noVerifySSL := fs.Bool("no-verify-ssl", false, "skip TLS certificate verification")
+	timeout := fs.Duration("timeout", 30*time.Second, "BloodHound API timeout")
+	noColorLong := fs.Bool("no-color", false, "disable output content coloring")
+	noColorShort := fs.Bool("nc", false, "disable output content coloring")
+	silent := fs.Bool("silent", false, "suppress non-essential output")
+
+	if hasHelpFlag(args) {
+		printBloodHoundSetupUsage(stdout)
+		return nil
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printBloodHoundSetupUsage(stdout)
+			return nil
+		}
+		return rawCLIError{Message: flagErrorMessage(err), Help: "Use -bh-setup -h for help."}
+	}
+
+	noColor := *noColorLong || *noColorShort
+	resolvedServer := firstNonEmpty(*server, os.Getenv("BLOODHOUND_URL"), "http://localhost:8080")
+
+	if !*silent {
+		printBanner(stdout, !noColor)
+		printStatus(stdout, "INF", "BloodHound: "+resolvedServer, !noColor)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	result, err := bloodhoundintegration.Run(ctx, bloodhoundintegration.Options{
+		Server:       resolvedServer,
+		Username:     firstNonEmpty(*username, os.Getenv("BLOODHOUND_USERNAME")),
+		Password:     firstNonEmpty(*password, os.Getenv("BLOODHOUND_PASSWORD")),
+		Token:        firstNonEmpty(*token, os.Getenv("BLOODHOUND_TOKEN")),
+		NoIcons:      *noIcons,
+		NoQueries:    *noQueries,
+		ResetQueries: *resetQueries,
+		NoVerifySSL:  *noVerifySSL,
+		Timeout:      *timeout,
+	})
+	if err != nil {
+		return err
+	}
+
+	if !*silent {
+		printBloodHoundSetupResult(stdout, result, !noColor)
 	}
 	return nil
 }
@@ -728,6 +800,7 @@ func printScanUsage(w io.Writer) {
 	fmt.Fprintln(w, "  credshound -t ~/lolcreds-templates -exclude-sources env -j")
 	fmt.Fprintln(w, "  credshound -bloodhound -o credshound-bloodhound.json")
 	fmt.Fprintln(w, "  credshound -silent -j -o findings.jsonl")
+	fmt.Fprintln(w, "  credshound -bh-setup -server http://localhost:8080")
 	fmt.Fprintln(w, "  credshound inspect-templates -t ~/lolcreds-templates")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "TARGET:")
@@ -759,9 +832,14 @@ func printScanUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -silent                    display findings only")
 	fmt.Fprintln(w, "  -nc, -no-color             disable output content coloring (ANSI escape codes)")
 	fmt.Fprintln(w, "  -j, -jsonl                 write findings in JSONL format")
-	fmt.Fprintln(w, "  -bh, -bloodhound           write findings as BloodHound OpenGraph JSON")
 	fmt.Fprintln(w, "  -o, -output PATH           write findings to file")
+	fmt.Fprintln(w, "  -fingerprint-key KEY       stable credential fingerprint key for BloodHound reuse analysis")
+	fmt.Fprintln(w, "  -ephemeral-fingerprint     use a per-scan random fingerprint key")
 	fmt.Fprintln(w, "  -show-secrets              print full secret values")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "INTEGRATIONS:")
+	fmt.Fprintln(w, "  -bh, -bloodhound           write findings as BloodHound OpenGraph JSON")
+	fmt.Fprintln(w, "  -bh-setup                  register BloodHound icons and saved queries")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "OPTIMIZATIONS:")
 	fmt.Fprintln(w, "  -max-file-size N           maximum config file size in bytes, default 2097152")
@@ -773,6 +851,34 @@ func printScanUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Recursive scanning is only used for bare config filenames. Absolute paths, home-relative paths,")
 	fmt.Fprintln(w, "and relative paths with directories are checked directly. Skip dirs affect only recursive searches.")
+}
+
+func printBloodHoundSetupUsage(w io.Writer) {
+	printBanner(w, false)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  credshound -bh-setup [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  credshound -bh-setup -server http://localhost:8080")
+	fmt.Fprintln(w, "  BLOODHOUND_URL=http://localhost:8080 BLOODHOUND_TOKEN=... credshound -bh-setup")
+	fmt.Fprintln(w, "  BLOODHOUND_URL=http://localhost:8080 BLOODHOUND_USERNAME=admin BLOODHOUND_PASSWORD=... credshound -bh-setup")
+	fmt.Fprintln(w, "  credshound -bh-setup -reset-queries")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "INTEGRATION:")
+	fmt.Fprintln(w, "  BloodHound OpenGraph       register custom node icons and saved Cypher queries")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  -server URL           BloodHound server URL, default BLOODHOUND_URL or http://localhost:8080")
+	fmt.Fprintln(w, "  -token TOKEN          BloodHound JWT bearer token, default BLOODHOUND_TOKEN")
+	fmt.Fprintln(w, "  -username USER        BloodHound username, default BLOODHOUND_USERNAME")
+	fmt.Fprintln(w, "  -password PASSWORD    BloodHound password, default BLOODHOUND_PASSWORD")
+	fmt.Fprintln(w, "  -reset-queries        delete existing CredsHound saved queries before import")
+	fmt.Fprintln(w, "  -no-icons             skip custom node icon setup")
+	fmt.Fprintln(w, "  -no-queries           skip saved query import")
+	fmt.Fprintln(w, "  -no-verify-ssl        skip TLS certificate verification")
+	fmt.Fprintln(w, "  -timeout DURATION     BloodHound API timeout, default 30s")
+	fmt.Fprintln(w, "  -silent               suppress non-essential output")
+	fmt.Fprintln(w, "  -nc, -no-color        disable output content coloring (ANSI escape codes)")
 }
 
 func printInspectTemplatesUsage(w io.Writer) {
@@ -830,6 +936,26 @@ func printUpdateFailure(w io.Writer, err error, sourceURL string, color bool) {
 	printStatus(w, "INF", "Reason: "+err.Error(), color)
 	printStatus(w, "INF", offlineScanHint(), color)
 	printStatus(w, "INF", "Offline zip: "+sourceURL, color)
+}
+
+func printBloodHoundSetupResult(w io.Writer, result bloodhoundintegration.Result, color bool) {
+	if result.IconsCreated {
+		printStatus(w, "INF", fmt.Sprintf("Registered %d BloodHound node kind(s)", len(bloodhoundintegration.NodeKinds)), color)
+	}
+	if result.IconsUpdated {
+		printStatus(w, "INF", fmt.Sprintf("Updated %d BloodHound node kind icon(s)", len(bloodhoundintegration.NodeKinds)), color)
+	}
+	if !result.IconsCreated && !result.IconsUpdated {
+		printStatus(w, "INF", "BloodHound node icon setup skipped", color)
+	}
+	if result.QueriesRemoved > 0 {
+		printStatus(w, "INF", fmt.Sprintf("Removed %d existing CredsHound saved query(s)", result.QueriesRemoved), color)
+	}
+	if result.QueriesCreated == 0 && result.QueriesUpdated == 0 && result.QueriesSkipped == 0 && result.QueriesRemoved == 0 {
+		printStatus(w, "INF", "BloodHound saved query import skipped", color)
+		return
+	}
+	printStatus(w, "INF", fmt.Sprintf("Imported %d saved query(s); updated %d; skipped %d current", result.QueriesCreated, result.QueriesUpdated, result.QueriesSkipped), color)
 }
 
 func onlineUpdateHint() string {
@@ -1055,6 +1181,15 @@ func defaultSkipDirs() map[string]bool {
 		"vendor":       true,
 		"venv":         true,
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 type repeatedFlag []string

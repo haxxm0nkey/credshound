@@ -15,17 +15,20 @@ import (
 const maxInterestingLocationReferences = 50
 
 type Options struct {
-	Roots          []string
-	MaxFileSize    int64
-	Recursive      bool
-	MaxDepth       int
-	SkipDirs       map[string]bool
-	ProcRoot       string
-	ShowSecrets    bool
-	URLBase        string
-	EnableBuiltins bool
-	IncludeSources map[string]bool
-	ExcludeSources map[string]bool
+	Roots                []string
+	MaxFileSize          int64
+	Recursive            bool
+	MaxDepth             int
+	SkipDirs             map[string]bool
+	WSLMountRoot         string
+	ProcRoot             string
+	ShowSecrets          bool
+	URLBase              string
+	EnableBuiltins       bool
+	IncludeSources       map[string]bool
+	ExcludeSources       map[string]bool
+	FingerprintKey       string
+	EphemeralFingerprint bool
 }
 
 type Result struct {
@@ -57,6 +60,7 @@ func Scan(ctx context.Context, entries []templates.Entry, opts Options) ([]Findi
 }
 
 func ScanWithStats(ctx context.Context, entries []templates.Entry, opts Options) (Result, error) {
+	opts = withFingerprintKey(opts)
 	compiled, stats := compile(entries)
 
 	var findings []Finding
@@ -114,6 +118,9 @@ func suppressTemplateFindingsForBuiltins(templateFindings, builtinFindings []Fin
 	coveredPaths := make(map[string]bool, len(builtinFindings))
 	for _, finding := range builtinFindings {
 		if finding.TemplateID != "filesystem" || finding.Source != "file" || !strings.EqualFold(finding.Confidence, "high") {
+			continue
+		}
+		if strings.HasPrefix(finding.CredentialID, "ai-mcp-") {
 			continue
 		}
 		highSignal[finding.Source+"\x00"+finding.Location+"\x00"+finding.Evidence] = true
@@ -256,6 +263,9 @@ func findingDedupeRank(f Finding) int {
 	if f.TemplateID != "filesystem" {
 		rank += 100
 	}
+	if f.TemplateID == "filesystem" && strings.HasPrefix(f.CredentialID, "ai-mcp-") {
+		rank -= 1
+	}
 	if f.URL != "" {
 		rank += 20
 	}
@@ -356,16 +366,17 @@ func procEnvironmentAggregationKey(f Finding) (string, bool) {
 
 func neutralProcEnvironmentFinding(f Finding) Finding {
 	return Finding{
-		TemplateID:     "process",
-		CredentialID:   "environment-variable",
-		Origin:         OriginObservation,
-		Product:        "Process environment",
-		Credential:     "Environment variable",
-		Source:         "proc",
-		Confidence:     "medium",
-		Location:       f.Location,
-		CredentialType: procEnvironmentCredentialType(f),
-		Evidence:       f.Evidence,
+		TemplateID:        "process",
+		CredentialID:      "environment-variable",
+		Origin:            OriginObservation,
+		Product:           "Process environment",
+		Credential:        "Environment variable",
+		Source:            "proc",
+		Confidence:        "medium",
+		Location:          f.Location,
+		CredentialType:    procEnvironmentCredentialType(f),
+		Evidence:          f.Evidence,
+		SecretFingerprint: f.SecretFingerprint,
 	}
 }
 
@@ -540,6 +551,9 @@ func syntheticObservation(f Finding) (string, Finding, bool) {
 	if strings.ToLower(f.Confidence) != "info" || strings.ToLower(f.Source) != "file" {
 		return "", Finding{}, false
 	}
+	if f.Origin == OriginBuiltin && f.TemplateID == "filesystem" && f.CredentialID != "interesting-location" {
+		return "", f, false
+	}
 
 	switch f.Evidence {
 	case "path exists":
@@ -650,7 +664,9 @@ func normalizeLargeRepeatCounts(pattern string) string {
 }
 
 func (c compiledCredential) finding(source, confidence, location, evidence string, opts Options) Finding {
-	return c.findingWithEvidence(source, confidence, location, redact(evidence, opts.ShowSecrets), opts)
+	finding := c.findingWithEvidence(source, confidence, location, redact(evidence, opts.ShowSecrets), opts)
+	finding.SecretFingerprint = fingerprintSecret(evidence, opts)
+	return finding
 }
 
 func (c compiledCredential) infoFinding(source, location, evidence string, opts Options) Finding {
